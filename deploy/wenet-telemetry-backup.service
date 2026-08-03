@@ -1,0 +1,16 @@
+[Unit]
+Description=Snapshot the Wenet telemetry database
+Documentation=file:/opt/wenet-telemetry/DEPLOY.md
+
+[Service]
+Type=oneshot
+User=wenet
+Group=wenet
+EnvironmentFile=/etc/wenet-telemetry.env
+ExecStart=/opt/wenet-telemetry/deploy/backup.sh
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wenet-telemetry

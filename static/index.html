@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wenet Telemetry</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1 id="flight-name" tabindex="0" role="button"
+          title="Click to rename">Wenet Telemetry</h1>
+      <select id="flight-select" aria-label="Flight"></select>
+    </div>
+  </div>
+
+  <div class="tiles" id="tiles">
+    <div class="tile">
+      <div class="tile-label">Altitude</div>
+      <div class="tile-value" id="kpi-alt">—</div>
+      <div class="tile-unit">m</div>
+    </div>
+    <div class="tile">
+      <div class="tile-label">Ascent rate</div>
+      <div class="tile-value" id="kpi-ascent">—</div>
+      <div class="tile-unit">m/s</div>
+    </div>
+    <div class="tile">
+      <div class="tile-label">Peak</div>
+      <div class="tile-value" id="kpi-peak">—</div>
+      <div class="tile-unit">m</div>
+    </div>
+    <div class="tile">
+      <div class="tile-label">Packets</div>
+      <div class="tile-value" id="kpi-packets">—</div>
+      <div class="tile-unit">received</div>
+    </div>
+    <!-- One card per checked field, generated from the sources list. -->
+    <div class="tiles-dynamic" id="field-tiles"></div>
+  </div>
+
+  <div class="topbar-actions">
+    <!-- Status is icon + word, never colour alone. -->
+    <span class="status" id="link-status" data-state="idle">
+      <span class="status-dot" aria-hidden="true"></span><span class="status-text">Connecting</span>
+    </span>
+
+    <div class="menu">
+      <button class="btn" id="export-toggle" type="button" aria-haspopup="true"
+              aria-expanded="false">Export ▾</button>
+      <div class="menu-panel" id="export-menu" hidden>
+        <div class="menu-label">Whole flight</div>
+        <a class="menu-item" id="dl-csv" href="#">Readings — CSV (long)</a>
+        <a class="menu-item" id="dl-jsonl" href="#">Packets — JSON Lines</a>
+        <a class="menu-item" id="dl-gps" href="#">GPS track — CSV</a>
+        <a class="menu-item" id="dl-cbor" href="#">Raw packets — CBOR archive</a>
+        <div class="menu-label">Per source — CSV</div>
+        <div id="dl-sources"></div>
+        <div class="menu-label">Everything</div>
+        <a class="menu-item" id="dl-db" href="/api/v1/export.db">Database snapshot</a>
+      </div>
+    </div>
+    <button id="theme-toggle" class="btn" type="button" aria-label="Toggle theme">
+      <span id="theme-icon">◐</span>
+    </button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <aside class="panel sources-panel">
+    <div class="panel-head">
+      <h2>Sources</h2>
+      <span class="hint" id="source-count"></span>
+    </div>
+    <div id="sources" class="sources">
+      <p class="empty">Waiting for the first packet…<br>
+        <span class="empty-sub">Sources and fields appear as they arrive — nothing is
+        configured in advance.</span></p>
+    </div>
+
+    <div class="panel-head">
+      <h2>Reporters</h2>
+      <span class="hint">receive diversity</span>
+    </div>
+    <div id="reporters" class="reporters"></div>
+  </aside>
+
+  <section class="content">
+
+    <div class="panel map-panel">
+      <div class="panel-head">
+        <h2>Track</h2>
+        <div class="panel-actions">
+          <span class="ramp-legend" id="ramp-legend" hidden>
+            <span class="ramp-label" id="ramp-lo">—</span>
+            <span class="ramp-bar" aria-hidden="true"></span>
+            <span class="ramp-label" id="ramp-hi">—</span>
+            <span class="ramp-caption">altitude</span>
+          </span>
+          <button class="btn" id="map-fit" type="button">Fit</button>
+          <button class="btn" id="map-out" type="button" aria-label="Zoom out">−</button>
+          <button class="btn" id="map-in" type="button" aria-label="Zoom in">+</button>
+        </div>
+      </div>
+      <div class="map-wrap">
+        <canvas id="map"></canvas>
+        <div class="map-empty" id="map-empty">No GPS fixes yet</div>
+        <div class="map-attrib">© OpenStreetMap contributors</div>
+      </div>
+    </div>
+
+    <div class="panel charts-panel">
+      <div class="panel-head">
+        <h2>Charts</h2>
+        <div class="panel-actions">
+          <span class="range-readout" id="range-readout"></span>
+          <select id="range-select" aria-label="Time range">
+            <option value="all">Whole flight</option>
+            <option value="300">Last 5 minutes</option>
+            <option value="900">Last 15 minutes</option>
+            <option value="1800">Last 30 minutes</option>
+            <option value="3600">Last hour</option>
+            <option value="10800">Last 3 hours</option>
+            <option value="custom" hidden>Custom</option>
+          </select>
+          <button class="btn" id="range-reset" type="button"
+                  title="Reset to the whole flight">Reset</button>
+          <div class="segmented" role="group" aria-label="X axis">
+            <button class="seg active" data-axis="time" type="button">Time</button>
+            <button class="seg" data-axis="altitude" type="button">Altitude</button>
+          </div>
+        </div>
+      </div>
+      <div id="charts" class="charts">
+        <p class="empty">Select fields on the left to plot them.</p>
+      </div>
+    </div>
+
+  </section>
+</main>
+
+<div id="tooltip" class="tooltip" hidden></div>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

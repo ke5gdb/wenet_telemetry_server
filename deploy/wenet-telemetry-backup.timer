@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly Wenet telemetry database snapshot
+
+[Timer]
+# 03:20 UTC, off the hour so it does not collide with everything else on the box.
+OnCalendar=*-*-* 03:20:00 UTC
+# A VPS that was asleep or rebooted still gets its backup.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

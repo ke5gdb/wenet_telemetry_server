@@ -1,0 +1,50 @@
+[Unit]
+Description=Wenet telemetry server
+Documentation=file:/opt/wenet-telemetry/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=wenet
+Group=wenet
+WorkingDirectory=/opt/wenet-telemetry
+EnvironmentFile=/etc/wenet-telemetry.env
+
+# --workers MUST stay 1. The live SSE fan-out is an in-process hub, so a second
+# worker would serve browsers that never receive events published by the first.
+# SQLite also wants a single writer. If this ever needs to scale, the answer is
+# a shared broker and Postgres, not more workers here.
+#
+# --proxy-headers with --forwarded-allow-ips makes request.client.host the real
+# client address rather than nginx's. The per-IP ingest rate limit is keyed on
+# that, so without it every ground station shares one bucket.
+ExecStart=/opt/wenet-telemetry/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 1 \
+    --proxy-headers \
+    --forwarded-allow-ips 127.0.0.1 \
+    --log-level info
+
+Restart=always
+RestartSec=3
+
+# The database is the only thing this process has any business writing.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wenet-telemetry
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wenet-telemetry
+
+[Install]
+WantedBy=multi-user.target
