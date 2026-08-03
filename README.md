@@ -9,6 +9,11 @@ resolution, the ground-station forwarder, the read API with a live SSE stream,
 the display, export, and the deployment guide. Nothing has been deployed to a
 real server yet: see [DEPLOY.md](DEPLOY.md).
 
+**Picking this up cold?** Start with [HANDOFF.md](HANDOFF.md) — it records what
+is *proven* working versus merely built, the failures that are silent, and the
+open items. Do not take a feature list at face value over its verification
+table.
+
 ## Why this is not just a table of numbers
 
 The payload does not tell you what it is going to send. Fields are named at
