@@ -691,13 +691,29 @@ class Store:
         return out
 
     def reporters(self, flight_id: int) -> list[dict]:
+        """Per-callsign reception counts, sensor and GPS together.
+
+        GPS receptions live in their own table because GPS is keyed per flight
+        rather than per source. Counting only `receptions` made a station that
+        forwards mostly GPS look nearly idle -- which is precisely the station
+        carrying the position data.
+        """
         rows = self.pool.get().execute(
-            "SELECT r.reporter_id, COUNT(*) AS packets, "
-            "       MIN(r.received_at) AS first, MAX(r.received_at) AS last "
-            "FROM receptions r JOIN packets p ON p.id=r.packet_id "
-            "JOIN sources s ON s.id=p.source_id WHERE s.flight_id=? "
-            "GROUP BY r.reporter_id ORDER BY packets DESC",
-            (flight_id,),
+            "SELECT reporter_id, SUM(packets) AS packets, "
+            "       SUM(sensor) AS sensor, SUM(gps) AS gps, "
+            "       MIN(first) AS first, MAX(last) AS last FROM ( "
+            "  SELECT r.reporter_id, COUNT(*) AS packets, COUNT(*) AS sensor, 0 AS gps, "
+            "         MIN(r.received_at) AS first, MAX(r.received_at) AS last "
+            "  FROM receptions r JOIN packets p ON p.id=r.packet_id "
+            "  JOIN sources s ON s.id=p.source_id WHERE s.flight_id=? "
+            "  GROUP BY r.reporter_id "
+            "  UNION ALL "
+            "  SELECT g.reporter_id, COUNT(*), 0, COUNT(*), "
+            "         MIN(g.received_at), MAX(g.received_at) "
+            "  FROM gps_receptions g JOIN gps x ON x.id=g.gps_id "
+            "  WHERE x.flight_id=? GROUP BY g.reporter_id "
+            ") GROUP BY reporter_id ORDER BY packets DESC",
+            (flight_id, flight_id),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -909,7 +925,8 @@ class Store:
             (flight_id,),
         ):
             packet = conn.execute(
-                "SELECT payload_time, time_epoch, count, data, truncated, altitude "
+                "SELECT payload_time, time_epoch, count, data, truncated, altitude, "
+                "       first_heard "
                 "FROM packets WHERE source_id=? ORDER BY time_epoch DESC LIMIT 1",
                 (src["id"],),
             ).fetchone()
@@ -929,6 +946,12 @@ class Store:
                 "last_seen": src["last_seen"],
                 "time": packet["payload_time"],
                 "time_epoch": packet["time_epoch"],
+                # When the *server* heard it. `time_epoch` is the payload's own
+                # RTC, which is only real time if a PCF8523 was found at boot --
+                # otherwise it restarts at 2021-01-01 every power cycle. Judging
+                # staleness on that pins a perfectly healthy source to STALLED
+                # forever while its values keep updating.
+                "heard_epoch": to_epoch(packet["first_heard"]),
                 "count": packet["count"],
                 "truncated": bool(packet["truncated"]),
                 "altitude": packet["altitude"],
@@ -970,6 +993,11 @@ class Store:
 
         return {
             "flight_id": flight_id,
+            # The browser needs this to measure staleness against the same clock
+            # the reception times were written on. Its own may be off -- a
+            # chase-vehicle tablet is not a reliable timepiece -- and comparing
+            # two clocks is the bug this field exists to stop repeating.
+            "server_now": to_epoch(iso_now()),
             "sources": sources,
             "gps": dict(fix) if fix else None,
             "gps_status": status,

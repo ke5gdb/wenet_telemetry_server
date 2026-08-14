@@ -203,6 +203,71 @@ def test_latest_reports_current_state(store):
     assert src["rate_hz"] == pytest.approx(1.0, abs=0.05)
 
 
+def test_reporters_counts_gps_receptions_too(store):
+    """A station forwarding mostly GPS was reading as nearly idle."""
+    store.ingest("KE5GDB", [sensor(1, 0, bmp_temp=1.0), gps(0, 500.0), gps(1, 505.0)])
+    store.ingest("K5NBC", [gps(2, 510.0)])          # GPS only
+
+    by_call = {r["reporter_id"]: r for r in store.reporters(1)}
+
+    assert by_call["KE5GDB"]["packets"] == 3        # 1 sensor + 2 gps
+    assert by_call["KE5GDB"]["sensor"] == 1
+    assert by_call["KE5GDB"]["gps"] == 2
+    # Would have been absent entirely before: it forwarded no sensor packets.
+    assert by_call["K5NBC"]["packets"] == 1
+    assert by_call["K5NBC"]["sensor"] == 0
+    assert by_call["K5NBC"]["gps"] == 1
+
+
+def test_reporters_span_covers_both_reception_tables(store):
+    store.ingest("KE5GDB", [sensor(1, 0, bmp_temp=1.0)], received_default=iso(T0))
+    store.ingest("KE5GDB", [gps(0, 500.0)],
+                 received_default=iso(T0 + timedelta(minutes=5)))
+
+    (row,) = store.reporters(1)
+    assert row["first"] == iso(T0)
+    assert row["last"] == iso(T0 + timedelta(minutes=5))
+
+
+def test_latest_reports_reception_time_not_just_payload_time(store):
+    """Staleness must not be judged on the payload's RTC.
+
+    An unset RTC restarts at 2021-01-01 on every boot, so a perfectly healthy
+    source would read as years stale while its values kept updating.
+    """
+    unset_rtc = {
+        "kind": "sensor",
+        "data": {"time": "2021-01-01T00:00:03.000000Z", "id": "RAB_HAT_ENV",
+                 "count": 3, "bmp_temp": -40.0},
+    }
+    store.ingest("KE5GDB", [unset_rtc], received_default=iso(T0))
+
+    (src,) = store.latest(1)["sources"]
+
+    # The payload's own clock is still reported, unaltered...
+    assert src["time"].startswith("2021-01-01")
+    # ...but the reception clock is what staleness can be measured against.
+    assert src["heard_epoch"] == pytest.approx(T0.timestamp())
+
+
+def test_latest_exposes_server_clock_for_skew_correction(store):
+    populate(store, 10)
+    out = store.latest(1)
+
+    assert out["server_now"] == pytest.approx(datetime.now(timezone.utc).timestamp(), abs=30)
+    # The gap the browser must correct for, on the data above, is years.
+    assert out["server_now"] - out["sources"][0]["heard_epoch"] < 30
+
+
+def test_heard_epoch_tracks_the_newest_packet(store):
+    store.ingest("KE5GDB", [sensor(1, 0, bmp_temp=1.0)], received_default=iso(T0))
+    store.ingest("KE5GDB", [sensor(2, 1, bmp_temp=2.0)],
+                 received_default=iso(T0 + timedelta(seconds=45)))
+
+    (src,) = store.latest(1)["sources"]
+    assert src["heard_epoch"] == pytest.approx((T0 + timedelta(seconds=45)).timestamp())
+
+
 def test_latest_with_no_gps_yet(store):
     store.ingest("KE5GDB", [sensor(1, 0, bmp_temp=1.0)])
     out = store.latest(1)

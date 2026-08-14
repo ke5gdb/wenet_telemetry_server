@@ -1,6 +1,7 @@
 # Handoff notes
 
-Working state as of **2026-07-31**. [DESIGN.md](DESIGN.md) is the architecture,
+Working state as of **2026-07-31**, plus the dashboard clock and reporter-tally
+fixes that followed it. [DESIGN.md](DESIGN.md) is the architecture,
 [README.md](README.md) the usage, [DEPLOY.md](DEPLOY.md) the server build. This
 file is the connective tissue: what is done, what is *proven* done, what is not,
 and the decisions whose reasoning does not survive in a diff.
@@ -110,6 +111,16 @@ Things that fail *silently*. Each cost real time or nearly did.
   (`time_source: receiver`), but do not "simplify" it away.
 - **Payload `id` is not decomposable.** RAB-8 sent `id: "generic"` with the real
   name in a separate `payload` field. `source_key` is the only identity.
+- **Never measure age against `time_epoch`.** That is the payload's own RTC,
+  which is real time only if a PCF8523 was found at boot; otherwise it restarts
+  at 2021-01-01 every power cycle. Staleness uses `heard_epoch` (the server's
+  reception clock) corrected by `server_now` for browser skew. Comparing two
+  different clocks is what produced a source reading `STALLED · 0.5 Hz` while
+  every value on the row kept updating. `rate_hz` is *correctly* on the payload
+  clock — a rate is a difference measured on one clock, so it is unaffected.
+- **GPS receptions live in their own table.** Anything counting per-callsign
+  activity must union `receptions` and `gps_receptions`. Joining only the former
+  dropped a GPS-only station out of the reporters panel completely.
 
 ### Local dev gotchas
 

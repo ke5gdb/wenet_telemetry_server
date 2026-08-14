@@ -125,6 +125,7 @@ GET   /api/v1/flights
 GET   /api/v1/flights/{id}/sources       discovered sources and their fields
 GET   /api/v1/flights/{id}/reporters     per-callsign reception counts
 GET   /api/v1/flights/{id}/latest        newest sample per source + current fix
+                                         (includes heard_epoch + server_now)
 GET   /api/v1/flights/{id}/series        downsampled values (?field=…&axis=…)
 GET   /api/v1/flights/{id}/track         GPS polyline, thinned
 POST  /api/v1/flights/{id}/backfill      re-resolve altitudes (?force)

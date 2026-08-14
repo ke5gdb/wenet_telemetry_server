@@ -152,10 +152,23 @@ function sourceLabel(src) {
   return task;
 }
 
+/* Server time, as best this browser can tell.
+
+   Staleness has to be measured on one clock. `time_epoch` is the payload's own
+   RTC, which is real time only if a PCF8523 was found at boot -- otherwise it
+   restarts at 2021-01-01 on every power cycle, and judging age against it pins
+   a healthy source to STALLED forever while its values keep updating. So the
+   comparison uses the server's reception clock, corrected for this machine's
+   offset from it. */
+function serverNow() {
+  return Date.now() / 1000 - (state.clockOffset || 0);
+}
+
 function isStalled(info) {
   if (!info) return true;
+  const heard = info.heard_epoch != null ? info.heard_epoch : info.time_epoch;
   const expected = info.rate_hz > 0 ? STALL_FACTOR / info.rate_hz : STALL_FLOOR_S;
-  const age = Date.now() / 1000 - info.time_epoch;
+  const age = serverNow() - heard;
   return age > Math.max(expected, STALL_FLOOR_S);
 }
 
@@ -163,13 +176,21 @@ function renderReporters(reporters) {
   const host = el("reporters");
   if (!reporters.length) { host.innerHTML = `<p class="empty">No receptions yet.</p>`; return; }
   const top = Math.max(...reporters.map((r) => r.packets));
-  host.innerHTML = reporters.map((r) => `
-    <div class="reporter">
+  host.innerHTML = reporters.map((r) => {
+    // The split is in the tooltip because a station can be carrying the flight
+    // on GPS alone, and a single merged number hides that.
+    const parts = [];
+    if (r.sensor != null) parts.push(`${r.sensor.toLocaleString()} sensor`);
+    if (r.gps != null) parts.push(`${r.gps.toLocaleString()} GPS`);
+    const title = parts.length ? `${escapeHtml(r.reporter_id)}: ${parts.join(", ")}` : "";
+    return `
+    <div class="reporter" title="${title}">
       <span class="reporter-name">${escapeHtml(r.reporter_id)}</span>
       <span class="reporter-bar"><span class="reporter-fill"
         style="width:${(r.packets / top * 100).toFixed(1)}%"></span></span>
       <span class="reporter-count">${r.packets.toLocaleString()}</span>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 }
 
 /* ----------------------------------------------------------------- charts */
@@ -525,6 +546,8 @@ async function loadFlightData() {
 
   state.sources = sources;
   state.latest = latest;
+  state.reporters = reporters;
+  if (latest?.server_now) state.clockOffset = Date.now() / 1000 - latest.server_now;
   // Assign colour slots in a stable order so they never shuffle.
   for (const src of sources) colorFor(src.source_key);
 
@@ -621,6 +644,9 @@ function applyUpdate(event) {
       info.count = packet.count;
       info.time = packet.time;
       info.time_epoch = Date.parse(packet.time) / 1000;
+      // The event arriving *is* the reception, so this is the freshest possible
+      // answer on the clock staleness is measured against.
+      info.heard_epoch = serverNow();
       info.packet_count += 1;
     }
   }
@@ -855,8 +881,20 @@ window.addEventListener("resize", () => {
   for (const { chart } of state.charts.values()) chart.draw();
 });
 
-setInterval(() => {
-  if (state.live && state.dirty) { state.dirty = false; loadSeries(); }
+/* Charts and the reporter tally both refresh here. The tally was previously
+   drawn only by loadFlightData(), which runs at boot and then only when a new
+   source or field appears -- so on a steady flight the bars held their
+   page-load values indefinitely. One GROUP BY every 5 s while live. */
+setInterval(async () => {
+  if (!state.live || !state.dirty) return;
+  state.dirty = false;
+  loadSeries();
+  try {
+    state.reporters = await api(`/api/v1/flights/${state.flightId}/reporters`);
+    renderReporters(state.reporters);
+  } catch {
+    // The link indicator already reports trouble; don't double-report it.
+  }
 }, REFRESH_MS);
 
 // Sources can go quiet without any event arriving, so re-evaluate stalled state
