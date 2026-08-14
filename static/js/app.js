@@ -204,6 +204,9 @@ function syncCharts() {
   }
   if (!wanted.length) {
     host.innerHTML = `<p class="empty">Select fields on the left to plot them.</p>`;
+    // loadSeries() is what normally redraws the cards, and it is not reached
+    // from here -- without this the last unchecked field keeps its card.
+    renderFieldTiles();
     return;
   }
   host.querySelector(".empty")?.remove();
@@ -235,16 +238,29 @@ function syncCharts() {
 
 /* ------------------------------------------------------------ time range */
 
-function rangeParams() {
+/* Two clocks reach this page and they are not the same clock. A reading carries
+   the sensor packet's own time -- the BLE forwarder's host clock where it rewrites
+   the field (its default), the payload RTC where it does not -- while every GPS row
+   is stamped from the receiver. Nothing keeps those two in step: an unsynced
+   forwarder host, or a payload whose RTC restarts at 2021-01-01 on a board that
+   found no PCF8523, puts them minutes to years apart.
+
+   Taking the newest of both and filtering *both* tables with it is how "Last 5
+   minutes" came to show nothing while packets were visibly arriving. The GPS
+   clock usually wins that max, so the window sat past the newest reading and
+   selected none of them. A window is therefore resolved on the clock it is about
+   to be applied to, and the two are never mixed. */
+function rangeParams(domain = "readings") {
   const { mode, seconds, start, end } = state.range;
   if (mode === "absolute" && start != null && end != null) {
-    return { start: new Date(start * 1000).toISOString(),
-             end: new Date(end * 1000).toISOString() };
+    const shift = clockOffset(domain);
+    return { start: new Date((start + shift) * 1000).toISOString(),
+             end: new Date((end + shift) * 1000).toISOString() };
   }
   if (mode === "relative" && seconds > 0) {
     // Anchor to the newest data, not to wall-clock: replaying a past flight
     // would otherwise ask for a window that ended hours ago and show nothing.
-    const anchor = newestSampleEpoch();
+    const anchor = newestEpoch(domain);
     if (anchor != null) {
       return { start: new Date((anchor - seconds) * 1000).toISOString(),
                end: new Date(anchor * 1000).toISOString() };
@@ -253,10 +269,34 @@ function rangeParams() {
   return {};
 }
 
-function newestSampleEpoch() {
-  const times = (state.latest?.sources || []).map((s) => s.time_epoch).filter(Boolean);
-  if (state.latest?.gps?.time_epoch) times.push(state.latest.gps.time_epoch);
+/** Newest sample on one clock: "readings" is the sensor-packet time the charts
+    are plotted against, "gps" the receiver time the track is stored on. */
+function newestEpoch(domain) {
+  if (domain === "gps") {
+    // The newest packet of any kind first; the newest one that carried a
+    // position is the fallback, because a receiver between locks still has a
+    // clock and the window should keep sliding while it hunts.
+    for (const t of [state.latest?.gps_status?.time_epoch, state.latest?.gps?.time_epoch]) {
+      if (Number.isFinite(t)) return t;
+    }
+    return null;
+  }
+  const times = (state.latest?.sources || [])
+    .map((s) => s.time_epoch)
+    .filter((t) => Number.isFinite(t));
   return times.length ? Math.max(...times) : null;
+}
+
+/* A drag on a chart produces a window in sensor-packet seconds, and the map has
+   no rows on that clock. Offsetting by how far apart the two clocks' newest
+   samples sit is an estimate -- they drift against each other -- but it is what
+   lets "look at the burst" select the matching stretch of track instead of
+   emptying the map. */
+function clockOffset(domain) {
+  if (domain !== "gps") return 0;
+  const gps = newestEpoch("gps");
+  const readings = newestEpoch("readings");
+  return gps != null && readings != null ? gps - readings : 0;
 }
 
 function setRange(next, { silent = false } = {}) {
@@ -310,7 +350,7 @@ function renderRangeReadout() {
   const node = el("range-readout");
   const { mode } = state.range;
   if (mode === "all") { node.textContent = ""; return; }
-  const p = rangeParams();
+  const p = rangeParams("readings");   // the readout describes the chart window
   if (!p.start) { node.textContent = ""; return; }
   const a = new Date(p.start), b = new Date(p.end);
   const span = (b - a) / 1000;
@@ -340,7 +380,7 @@ async function refreshTrack() {
   // A time window on the map is meaningless when the charts are plotting
   // against altitude -- the window is a chart concept there.
   if (state.axis === "time") {
-    const { start, end } = rangeParams();
+    const { start, end } = rangeParams("gps");
     if (start) { params.set("start", start); params.set("end", end); }
   }
   try {
@@ -464,7 +504,7 @@ async function loadSeries() {
   const fields = [...state.charts.keys()];
   const params = new URLSearchParams({ axis: state.axis, max_points: "900" });
   for (const f of fields) params.append("field", f);
-  const { start, end } = rangeParams();
+  const { start, end } = rangeParams("readings");
   if (start) { params.set("start", start); params.set("end", end); }
 
   let series;
@@ -662,6 +702,10 @@ function applyUpdate(event) {
         ...(state.latest.gps || {}),
         altitude: fix.alt, ascent_rate: fix.ascent_rate,
         latitude: fix.lat, longitude: fix.lon,
+        // Carried forward because a relative window anchors on it. Left at the
+        // page-load value, the map's window would stop sliding the moment the
+        // stream took over from the initial fetch.
+        time_epoch: Date.parse(fix.t) / 1000,
       };
       if (fix.alt != null) {
         state.latest.peak_altitude = Math.max(state.latest.peak_altitude ?? -Infinity, fix.alt);
@@ -670,6 +714,7 @@ function applyUpdate(event) {
     const newest = event.gps[event.gps.length - 1];
     state.latest.gps_status = {
       ...(state.latest.gps_status || {}),
+      time_epoch: Date.parse(newest.t) / 1000,
       num_sv: newest.num_sv,
       has_position: newest.lat != null,
       position_is_stale: newest.lat == null && !!state.latest.gps,
@@ -757,6 +802,64 @@ function wireRename() {
     if (e.key === "Enter") { e.preventDefault(); title.blur(); }
     if (e.key === "Escape") { renderFlightName(); title.blur(); }
   });
+}
+
+/* Panels fold away so a phone can show one thing at a time. The state is per
+   browser rather than per flight: someone who folded the map away wants it
+   folded on the next flight too, and on the next reload. */
+const COLLAPSE_KEY = "wenet.collapsed";
+
+function wireCollapse() {
+  let collapsed;
+  try {
+    collapsed = new Set(JSON.parse(localStorage.getItem(COLLAPSE_KEY) || "[]"));
+  } catch { collapsed = new Set(); }
+
+  const save = () => {
+    try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...collapsed])); }
+    catch { /* private browsing */ }
+  };
+
+  for (const head of document.querySelectorAll(".panel-head[data-collapse]")) {
+    const id = head.dataset.collapse;
+    const body = el(id);
+    const btn = head.querySelector(".collapse-btn");
+    if (!body || !btn) continue;
+
+    const apply = (open) => {
+      body.hidden = !open;
+      head.classList.toggle("collapsed", !open);
+      btn.setAttribute("aria-expanded", String(open));
+      if (!open) return;
+      // A canvas measures itself when it draws, and a hidden one measures zero,
+      // so anything revealed has to be told to draw again. The map needs more
+      // than a redraw: a fit() computed while it was folded away measured that
+      // zero and settled on the world view, so frame the track again unless the
+      // user has panned it somewhere themselves.
+      if (body.contains(map.canvas)) {
+        if (map.userMoved) map.draw(); else map.fit();
+      } else {
+        for (const { chart } of state.charts.values()) chart.draw();
+      }
+    };
+
+    const toggle = () => {
+      const open = body.hidden;            // hidden now means we are opening it
+      if (open) collapsed.delete(id); else collapsed.add(id);
+      apply(open);
+      save();
+    };
+
+    btn.addEventListener("click", (e) => { e.stopPropagation(); toggle(); });
+    head.addEventListener("click", (e) => {
+      // The head also carries live controls -- zoom, range, axis. Reaching for
+      // one of those is not a request to fold the panel away.
+      if (e.target.closest(".panel-actions")) return;
+      toggle();
+    });
+
+    apply(!collapsed.has(id));
+  }
 }
 
 function renderFlightName() {
@@ -868,6 +971,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") toggleExportMenu(false);
 });
 wireRename();
+wireCollapse();
 
 el("theme-toggle").addEventListener("click", () => {
   const current = document.documentElement.getAttribute("data-theme");

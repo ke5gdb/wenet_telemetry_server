@@ -80,6 +80,10 @@
 
 * { box-sizing: border-box; }
 
+/* Several panel bodies carry a `display` of their own, which would otherwise
+   beat the hidden attribute -- and hidden is how a collapsed panel is folded. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font-family: var(--font);
@@ -242,13 +246,43 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
 }
 
 .panel-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center;
   gap: 8px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--border);
 }
-.panel-actions { display: flex; align-items: center; gap: 6px; }
-.hint { font-size: 11px; color: var(--text-muted); }
+.panel-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.hint { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+
+/* ------------------------------------------------------- collapsible panels */
+
+/* A phone shows one thing at a time. Folding the map or the source list away is
+   how the charts get the screen, so every panel body can be collapsed -- on the
+   desktop layout too, where a long source list otherwise pushes the reporters
+   below the fold. */
+.panel-head[data-collapse] { cursor: pointer; user-select: none; }
+
+.collapse-btn {
+  font: inherit; font-size: 10px; line-height: 1;
+  color: var(--text-muted);
+  background: none; border: 0; cursor: pointer;
+  /* Negative margin keeps the glyph aligned with the heading while the tap
+     target stays finger-sized. */
+  padding: 6px; margin: -6px 0 -6px -6px;
+  border-radius: 4px;
+  transition: transform 0.12s ease;
+}
+.collapse-btn:hover { color: var(--text-primary); }
+.panel-head.collapsed .collapse-btn { transform: rotate(-90deg); }
+/* Zoom buttons and range pickers act on a body that is not on screen, and on a
+   phone they are a second row of the space collapsing was meant to free. The
+   hint stays -- "2 sources" is worth reading while folded. */
+.panel-head.collapsed .panel-actions { display: none; }
+
+/* A collapsed head is the panel's last visible row, so its rule would double up
+   against the panel border. The following head takes the divider instead. */
+.panel-head.collapsed { border-bottom: 0; }
+.panel > [hidden] + .panel-head { border-top: 1px solid var(--border); }
 
 .content { display: flex; flex-direction: column; gap: var(--pad); min-width: 0; }
 
@@ -401,8 +435,49 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
 @media (max-width: 900px) {
   .layout { grid-template-columns: minmax(0, 1fr); }
   .topbar { gap: 10px; }
-  .tiles { order: 3; width: 100%; }
+  /* The basis has to come with it: `flex: 1` above sets basis 0, and a width of
+     100% on a flex item with a zero basis does not claim a line of its own. */
+  .tiles { order: 3; width: 100%; flex-basis: 100%; }
   .map-wrap { height: 260px; }
+}
+
+/* Phone. The header is the thing that has to give: on a 390 px screen the
+   brand, the status, Export and the theme toggle each claimed a row of their
+   own, and the four stat tiles two more -- most of the display gone before a
+   single chart. Everything above collapses to two rows, and the header stops
+   being sticky so scrolling reclaims even those. */
+@media (max-width: 640px) {
+  .topbar { padding: 8px 10px; gap: 8px; position: static; }
+
+  /* The identity shrinks before the controls do -- a truncated flight name is
+     still readable, a wrapped button row is not. A zero basis is what lets it
+     shrink: the flight select is wider than half the screen on its own. */
+  .brand { min-width: 0; flex: 1 1 0; gap: 8px; }
+  .brand > div { min-width: 0; }
+  #flight-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #flight-select { width: 100%; max-width: 100%; }
+
+  .topbar-actions { gap: 6px; flex: none; }
+  .status { font-size: 11px; }
+  .btn { padding: 4px 8px; }
+
+  /* Four across rather than two-by-two: the numbers stay legible at this size
+     and the header keeps a row. */
+  .tiles { gap: 6px; }
+  .tiles > .tile { flex: 1 1 0; min-width: 0; padding: 5px 8px; }
+  /* "Ascent rate" on two lines would set the height of the whole row. */
+  .tiles > .tile .tile-label { font-size: 9px; letter-spacing: 0.03em;
+                               white-space: nowrap; }
+  .tile-value { font-size: 18px; }
+  /* The field cards get their own scrolling row -- there can be any number. */
+  .tiles-dynamic { flex: 1 0 100%; }
+
+  /* Range select, Reset and the axis toggle do not fit beside the title. */
+  .panel-head { flex-wrap: wrap; row-gap: 6px; }
+  .panel-actions { flex-wrap: wrap; }
+
+  .map-wrap { height: 220px; }
+  .chart canvas { height: 96px; }
 }
 
 /* A chase vehicle in direct sun: bigger type, heavier ink. */

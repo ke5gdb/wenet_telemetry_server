@@ -184,20 +184,72 @@ automatically. A 40 GB VPS holds years of flights; if that ever changes, drop
 old `raw_cbor` blobs first, since they are the bulk and the decoded data
 survives without them.
 
-## Upgrading
+## Redeploying
 
 ```bash
 cd /opt/wenet-telemetry
+sudo systemctl start wenet-telemetry-backup    # cheap; the migration is one-way
 sudo git pull
-sudo .venv/bin/pip install -r requirements.txt
+sudo .venv/bin/pip install -r requirements.txt # only needed if requirements changed
 sudo systemctl restart wenet-telemetry
 ```
 
-Schema changes apply themselves at startup: new columns are added and
-backfilled from the data already present (`app/db.py`). Take a backup first
-anyway — the migration is one-way.
+Schema changes apply themselves at startup: new columns are added and backfilled
+from the data already present (`app/db.py`).
+
+### Then check the deploy actually took
+
+A restart proves the *service* restarted, not that it is running the code you
+just pulled — and it says nothing at all about the browser. Check both layers
+separately, because they fail independently.
+
+**Is the server running the new code?** Ask it for something only the new code
+returns:
+
+```bash
+git -C /opt/wenet-telemetry log --oneline -1        # what the disk has
+systemctl show -p ExecMainStartTimestamp wenet-telemetry   # when it last started
+
+# does the API expose the field the new build added?
+curl -s localhost:8000/api/v1/flights/1/latest | grep -o '"server_now"' \
+  || echo "SERVER IS RUNNING OLD CODE"
+```
+
+If the field is missing, the service did not restart onto the new tree — check
+`journalctl -u wenet-telemetry -n 50` for a start failure that left the old
+process up.
+
+**Is the browser running the new code?** This is the one that catches people
+out: two of the three dashboard fixes live in `static/js/app.js`, and a browser
+holding a cached copy keeps running the old logic against a correctly updated
+server. The symptom is a partial fix — the parts implemented server-side work,
+the parts implemented in the page do not.
+
+```bash
+curl -sI https://YOUR.DOMAIN/static/js/app.js | grep -iE 'cache-control|etag|last-modified'
+# want: Cache-Control: no-cache  (revalidates every load)
+```
+
+Then hard-refresh the page: **Ctrl-Shift-R**, or Shift-Reload, or DevTools →
+Network → *Disable cache*. On a phone, close the tab rather than trusting pull
+to refresh.
+
+If that header still reads `max-age=3600`, the nginx site file predates this
+change — re-copy `deploy/nginx-wenet-telemetry.conf` and
+`sudo nginx -t && sudo systemctl reload nginx`.
+
+**Anyone watching the display should hard-refresh after every deploy.** The
+`no-cache` header makes this automatic for anyone opening the page fresh, but a
+tab that has been sitting open since before the deploy is still running whatever
+it loaded then.
 
 ## Troubleshooting
+
+**A deploy appears to have done nothing, or only half worked.** Almost always a
+cached `static/js/app.js` — the server is new and the page is not, so fixes made
+server-side land while fixes made in the page do not. Hard-refresh and see
+[Redeploying](#redeploying). Confirm with
+`curl -sI https://YOUR.DOMAIN/static/js/app.js | grep -i cache-control`.
 
 **The display connects but never updates.** SSE is being buffered. Confirm
 `proxy_buffering off` is in the `/events` location, that gzip is not applied to

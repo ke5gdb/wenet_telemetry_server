@@ -73,7 +73,9 @@
 <main class="layout">
 
   <aside class="panel sources-panel">
-    <div class="panel-head">
+    <div class="panel-head" data-collapse="sources">
+      <button class="collapse-btn" type="button" aria-expanded="true"
+              aria-controls="sources" aria-label="Sources">▾</button>
       <h2>Sources</h2>
       <span class="hint" id="source-count"></span>
     </div>
@@ -83,7 +85,9 @@
         configured in advance.</span></p>
     </div>
 
-    <div class="panel-head">
+    <div class="panel-head" data-collapse="reporters">
+      <button class="collapse-btn" type="button" aria-expanded="true"
+              aria-controls="reporters" aria-label="Reporters">▾</button>
       <h2>Reporters</h2>
       <span class="hint">receive diversity</span>
     </div>
@@ -93,7 +97,9 @@
   <section class="content">
 
     <div class="panel map-panel">
-      <div class="panel-head">
+      <div class="panel-head" data-collapse="map-body">
+        <button class="collapse-btn" type="button" aria-expanded="true"
+                aria-controls="map-body" aria-label="Track">▾</button>
         <h2>Track</h2>
         <div class="panel-actions">
           <span class="ramp-legend" id="ramp-legend" hidden>
@@ -107,7 +113,7 @@
           <button class="btn" id="map-in" type="button" aria-label="Zoom in">+</button>
         </div>
       </div>
-      <div class="map-wrap">
+      <div class="map-wrap" id="map-body">
         <canvas id="map"></canvas>
         <div class="map-empty" id="map-empty">No GPS fixes yet</div>
         <div class="map-attrib">© OpenStreetMap contributors</div>
@@ -115,7 +121,9 @@
     </div>
 
     <div class="panel charts-panel">
-      <div class="panel-head">
+      <div class="panel-head" data-collapse="charts">
+        <button class="collapse-btn" type="button" aria-expanded="true"
+                aria-controls="charts" aria-label="Charts">▾</button>
         <h2>Charts</h2>
         <div class="panel-actions">
           <span class="range-readout" id="range-readout"></span>
