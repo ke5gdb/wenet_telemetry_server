@@ -292,16 +292,44 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
 
 .payload-group { margin-bottom: 4px; }
 .payload-name {
+  font: inherit;
   font-size: 11px; font-weight: 600; color: var(--text-secondary);
-  padding: 6px 8px 2px;
+  padding: 6px 8px 4px;
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; text-align: left;
+  background: none; border: 0; cursor: pointer;
 }
+.payload-name:hover { color: var(--text-primary); }
+.payload-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* A payload is a whole instrument stack and a source is one sensor on it, so
+   the list folds at both levels: a flight with three payloads is otherwise a
+   hundred rows of checkbox before the second one is reachable. */
+.fold-caret {
+  font-size: 9px; color: var(--text-muted); flex: none;
+  width: 9px; text-align: center;
+  transition: transform 0.12s ease;
+}
+.fold-count {
+  margin-left: auto; font-size: 10px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; font-weight: 400;
+}
+.payload-group.collapsed > .payload-name .fold-caret,
+.source.collapsed > .source-head .fold-caret { transform: rotate(-90deg); }
+.payload-group.collapsed > .source { display: none; }
+.source.collapsed > .fields { display: none; }
 
 .source {
   border-radius: 8px;
   padding: 6px 8px;
   margin-bottom: 2px;
 }
-.source-head { display: flex; align-items: center; gap: 7px; }
+.source-head {
+  font: inherit;
+  display: flex; align-items: center; gap: 7px;
+  width: 100%; text-align: left;
+  padding: 2px 0; background: none; border: 0; cursor: pointer;
+}
 .source-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
 .source-name { font-size: 12px; font-weight: 600; color: var(--text-primary);
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

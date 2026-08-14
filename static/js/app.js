@@ -21,6 +21,7 @@ const state = {
   flights: [],
   sources: [],
   selected: new Set(),       // "source_key:field_name"
+  folded: new Set(),         // "payload:<name>" / "source:<key>" rows folded shut
   colors: new Map(),         // source_key -> categorical slot (1-8)
   axis: "time",
   charts: new Map(),         // key -> {chart, wrap, meta}
@@ -80,29 +81,54 @@ function renderSources() {
   host.innerHTML = "";
 
   for (const [payload, sources] of byPayload) {
+    const groupKey = `payload:${payload}`;
+    const groupFolded = state.folded.has(groupKey);
     const group = document.createElement("div");
-    group.className = "payload-group";
-    group.innerHTML = `<div class="payload-name">${escapeHtml(payload)}</div>`;
+    group.className = "payload-group" + (groupFolded ? " collapsed" : "");
+
+    const groupHead = document.createElement("button");
+    groupHead.type = "button";
+    groupHead.className = "payload-name";
+    groupHead.setAttribute("aria-expanded", String(!groupFolded));
+    // The field count is what the fold is trading away, so it is the number
+    // worth showing on a folded row.
+    const fieldCount = sources.reduce((n, s) => n + s.fields.length, 0);
+    groupHead.title = `${sources.length} source${sources.length === 1 ? "" : "s"} · ${
+      fieldCount} field${fieldCount === 1 ? "" : "s"}`;
+    groupHead.innerHTML = `
+      <span class="fold-caret" aria-hidden="true">▾</span>
+      <span class="payload-label">${escapeHtml(payload)}</span>
+      <span class="fold-count">${sources.length} · ${fieldCount}</span>`;
+    groupHead.addEventListener("click", () => toggleFold(groupKey));
+    group.appendChild(groupHead);
 
     for (const src of sources) {
       const info = live.get(src.source_key);
       // A finished flight is not "stalled" -- it is over. Only a live flight
       // can have a source that has stopped reporting.
       const stalled = state.live && isStalled(info);
+      const srcKey = `source:${src.source_key}`;
+      const srcFolded = state.folded.has(srcKey);
       const node = document.createElement("div");
-      node.className = "source" + (stalled ? " stalled" : "");
+      node.className = "source" + (stalled ? " stalled" : "") +
+                       (srcFolded ? " collapsed" : "");
 
       const rate = info ? `${info.rate_hz.toFixed(1)} Hz` : "—";
       const count = info ? info.packet_count.toLocaleString() : "0";
 
-      node.innerHTML = `
-        <div class="source-head">
-          <span class="source-dot" style="background:${colorFor(src.source_key)}"></span>
-          <span class="source-name" title="${escapeHtml(src.source_key)}">${escapeHtml(
-            sourceLabel(src))}</span>
-          <span class="source-meta">${
-            stalled ? '<span class="source-flag">STALLED</span> ' : ""}${rate} · ${count}</span>
-        </div>`;
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className = "source-head";
+      head.setAttribute("aria-expanded", String(!srcFolded));
+      head.innerHTML = `
+        <span class="fold-caret" aria-hidden="true">▾</span>
+        <span class="source-dot" style="background:${colorFor(src.source_key)}"></span>
+        <span class="source-name" title="${escapeHtml(src.source_key)}">${escapeHtml(
+          sourceLabel(src))}</span>
+        <span class="source-meta">${
+          stalled ? '<span class="source-flag">STALLED</span> ' : ""}${rate} · ${count}</span>`;
+      head.addEventListener("click", () => toggleFold(srcKey));
+      node.appendChild(head);
 
       const fields = document.createElement("div");
       fields.className = "fields";
@@ -114,6 +140,17 @@ function renderSources() {
     }
     host.appendChild(group);
   }
+}
+
+/* A payload with three sensors and forty fields is most of the list. Folding is
+   held in state rather than on the nodes because renderSources() rebuilds the
+   whole list -- every packet while live, and on a timer besides -- so anything
+   left in the DOM would spring back open a moment later. */
+function toggleFold(key) {
+  if (state.folded.has(key)) state.folded.delete(key); else state.folded.add(key);
+  try { localStorage.setItem(FOLD_KEY, JSON.stringify([...state.folded])); }
+  catch { /* private browsing */ }
+  renderSources();
 }
 
 function fieldRow(src, field, info) {
@@ -808,6 +845,18 @@ function wireRename() {
    browser rather than per flight: someone who folded the map away wants it
    folded on the next flight too, and on the next reload. */
 const COLLAPSE_KEY = "wenet.collapsed";
+const FOLD_KEY = "wenet.folded";
+
+/* Which rows of the source list are folded shut. Kept out of the per-flight
+   field selection: a payload someone never looks at is one they never look at
+   on the next flight either. */
+function restoreFolds() {
+  try {
+    for (const key of JSON.parse(localStorage.getItem(FOLD_KEY) || "[]")) {
+      state.folded.add(key);
+    }
+  } catch { /* ignore */ }
+}
 
 function wireCollapse() {
   let collapsed;
@@ -972,6 +1021,7 @@ document.addEventListener("keydown", (e) => {
 });
 wireRename();
 wireCollapse();
+restoreFolds();
 
 el("theme-toggle").addEventListener("click", () => {
   const current = document.documentElement.getAttribute("data-theme");
