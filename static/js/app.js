@@ -336,9 +336,9 @@ function clockOffset(domain) {
   return gps != null && readings != null ? gps - readings : 0;
 }
 
-function setRange(next, { silent = false } = {}) {
+function setRange(next, { silent = false, push = true } = {}) {
   state.range = next;
-  syncRangeToUrl();
+  syncViewToUrl({ push });
   if (!silent) {
     el("range-select").value =
       next.mode === "all" ? "all"
@@ -352,13 +352,17 @@ function setRange(next, { silent = false } = {}) {
   refreshTrack();
 }
 
-/* Keep the window in the address bar so a zoomed view can be pasted to someone
-   else -- "look at the burst" is the normal thing to want to share. */
-function syncRangeToUrl() {
+/* The whole view lives in the address bar: which window, which axis, and how
+   far a drag on the altitude axis zoomed in. Two things fall out of that. A
+   zoomed view can be pasted to someone else -- "look at the burst" is the
+   normal thing to want to share -- and, because each deliberate change pushes a
+   history entry instead of rewriting the current one, the browser's Back button
+   walks back out of a selection rather than leaving the page. */
+function viewUrl() {
   const url = new URL(location.href);
-  url.searchParams.delete("range");
-  url.searchParams.delete("from");
-  url.searchParams.delete("to");
+  for (const key of ["range", "from", "to", "axis", "dmin", "dmax"]) {
+    url.searchParams.delete(key);
+  }
 
   if (state.range.mode === "relative") {
     url.searchParams.set("range", String(state.range.seconds));
@@ -366,7 +370,27 @@ function syncRangeToUrl() {
     url.searchParams.set("from", new Date(state.range.start * 1000).toISOString());
     url.searchParams.set("to", new Date(state.range.end * 1000).toISOString());
   }
-  history.replaceState(null, "", url);
+
+  if (state.axis === "altitude") {
+    url.searchParams.set("axis", "altitude");
+    // A drag on the altitude axis selects metres, not a time window, so it
+    // cannot be expressed as from/to and gets its own pair.
+    if (state.domain.min != null && state.domain.max != null) {
+      url.searchParams.set("dmin", String(Math.round(state.domain.min)));
+      url.searchParams.set("dmax", String(Math.round(state.domain.max)));
+    }
+  }
+  return url;
+}
+
+/* `push` for anything the user did on purpose -- a drag, a range, an axis --
+   so each becomes a step Back can undo. Everything else replaces, or the live
+   refresh would bury the entry the user arrived from under its own churn. */
+function syncViewToUrl({ push = false } = {}) {
+  const url = viewUrl();
+  if (url.href === location.href) return;   // nothing moved; no dead entry
+  if (push) history.pushState(null, "", url);
+  else history.replaceState(null, "", url);
 }
 
 function rangeFromUrl() {
@@ -381,6 +405,23 @@ function rangeFromUrl() {
   const seconds = Number(p.get("range"));
   if (seconds > 0) return { mode: "relative", seconds, start: null, end: null };
   return null;
+}
+
+/* Both halves must be present and ordered, or a half-typed URL would zoom the
+   sounding to a range starting at zero metres. */
+function domainFromUrl(params, axis) {
+  const min = Number(params.get("dmin")), max = Number(params.get("dmax"));
+  const usable = axis === "altitude" && params.has("dmin") && params.has("dmax")
+    && isFinite(min) && isFinite(max) && max > min;
+  return usable ? { min, max } : { min: null, max: null };
+}
+
+/* The segmented control and the axis are one thing; popstate has to move both,
+   so neither the click handler nor the history listener owns it alone. */
+function setAxis(axis, { push = true } = {}) {
+  state.axis = axis;
+  document.querySelectorAll(".seg").forEach((b) =>
+    b.classList.toggle("active", b.dataset.axis === axis));
 }
 
 function renderRangeReadout() {
@@ -405,6 +446,7 @@ function handleSelect(from, to) {
     // The x axis is metres here, so a drag is not a time window. Zoom the view
     // rather than pretending to filter by time.
     state.domain = { min: from, max: to };
+    syncViewToUrl({ push: true });
     applyDomain();
     return;
   }
@@ -592,6 +634,24 @@ async function loadSeries() {
 
 /* ------------------------------------------------------------------- data */
 
+/* `{server}/KE5GDB` shows one transmitter's flights, so a link can be handed to
+   the chase team without explaining which entry in the dropdown to pick. The
+   path is the filter -- there is nothing to set up and nothing to get wrong on
+   the receiving end.
+
+   Read once at load: the same file is served for every callsign, so the path is
+   the only thing that distinguishes them. Matched case-insensitively, because a
+   callsign typed into a phone rarely arrives capitalised. */
+const CALLSIGN_FILTER = (() => {
+  const segment = decodeURIComponent(location.pathname.replace(/^\/+|\/+$/g, ""));
+  return /^[A-Za-z0-9][A-Za-z0-9-]{2,15}$/.test(segment) ? segment.toUpperCase() : null;
+})();
+
+function matchesCallsign(flight) {
+  if (!CALLSIGN_FILTER) return true;
+  return (flight.payload_callsign || "").toUpperCase() === CALLSIGN_FILTER;
+}
+
 /* The transmitter is shown from the flight's own field, not read out of its
    name. The name is a label a human owns -- rename a flight "RAB-9" the moment
    it lands, which is the normal thing to do, and a callsign baked into that
@@ -605,19 +665,31 @@ function flightLabel(flight) {
 
 async function loadFlights() {
   state.flights = await api("/api/v1/flights");
+  // The full list stays in state -- renderFlightName and the live check look a
+  // flight up by id, and on /KE5GDB that id can still arrive from ?flight=N.
+  const shown = state.flights.filter(matchesCallsign);
+
+  const chip = el("callsign-chip");
+  chip.hidden = !CALLSIGN_FILTER;
+  if (CALLSIGN_FILTER) chip.textContent = CALLSIGN_FILTER;
+
   const select = el("flight-select");
-  select.innerHTML = state.flights.map((f) =>
+  select.innerHTML = shown.map((f) =>
     `<option value="${f.id}">${escapeHtml(flightLabel(f))} — ${
       f.packet_count.toLocaleString()} pkt${
       f.ended_at ? "" : " · open"}</option>`).join("")
-    || `<option>No flights yet</option>`;
+    || `<option>${CALLSIGN_FILTER
+        ? `Nothing from ${escapeHtml(CALLSIGN_FILTER)} yet`
+        : "No flights yet"}</option>`;
 
-  if (state.flightId == null && state.flights.length) {
+  if (state.flightId == null && shown.length) {
     // ?flight=N makes a past flight linkable -- the launch team sharing "look at
-    // this bit" is the normal case after a flight, not an edge case.
+    // this bit" is the normal case after a flight, not an edge case. It only
+    // wins if it belongs to the transmitter in the path, so a stale id cannot
+    // quietly show someone else's balloon under this callsign's link.
     const asked = Number(new URLSearchParams(location.search).get("flight"));
-    const found = state.flights.find((f) => f.id === asked);
-    state.flightId = found ? found.id : state.flights[0].id;
+    const found = shown.find((f) => f.id === asked);
+    state.flightId = found ? found.id : shown[0].id;
   }
   if (state.flightId != null) select.value = String(state.flightId);
 
@@ -925,7 +997,10 @@ function wireCollapse() {
 
 function renderFlightName() {
   const flight = state.flights.find((f) => f.id === state.flightId);
-  el("flight-name").textContent = flight ? flight.name : "Wenet Telemetry";
+  // With nothing to name yet, a callsign link should still say whose page this
+  // is rather than falling back to the product name.
+  el("flight-name").textContent =
+    flight ? flight.name : (CALLSIGN_FILTER || "Wenet Telemetry");
 }
 
 /* ------------------------------------------------------------------ misc */
@@ -982,17 +1057,29 @@ el("map-out").addEventListener("click", () => map.zoomBy(-1));
 
 for (const btn of document.querySelectorAll(".seg")) {
   btn.addEventListener("click", () => {
-    document.querySelectorAll(".seg").forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-    state.axis = btn.dataset.axis;
+    setAxis(btn.dataset.axis);
     // Metres and seconds are not the same domain; carrying one over to the
     // other would zoom to a nonsense window.
     state.domain = { min: null, max: null };
     setCursor(null);
+    syncViewToUrl({ push: true });
     loadSeries();
     refreshTrack();
   });
 }
+
+/* Back and Forward. The URL is already the one being returned to, so the view
+   is rebuilt from it rather than from a stack we would have to keep in step. */
+window.addEventListener("popstate", () => {
+  const params = new URLSearchParams(location.search);
+  setAxis(params.get("axis") === "altitude" ? "altitude" : "time");
+  state.domain = domainFromUrl(params, state.axis);
+  setCursor(null);
+  // No push: this *is* the history moving. Pushing here would make Back append
+  // a new entry and the button would never get anywhere.
+  setRange(rangeFromUrl() || { mode: "all", seconds: 0, start: null, end: null },
+           { push: false });
+});
 
 el("range-select").addEventListener("change", (e) => {
   const value = e.target.value;
@@ -1068,11 +1155,17 @@ setInterval(async () => {
 // closed -- nothing about it can change again.
 setInterval(() => { if (state.live) renderSources(); }, 3000);
 
+// A /KE5GDB link is handed out before the launch, so it opens on nothing and
+// there is no flight to subscribe to. Look again periodically rather than
+// asking someone to reload the page at the one moment they are busy.
+setInterval(() => { if (state.flightId == null) boot(); }, 15000);
+
 async function boot() {
   try {
     await loadFlights();
     if (state.flightId == null) {
       setStatus("idle", "No flights");
+      renderFlightName();
       return;
     }
     await loadFlightData();
@@ -1086,14 +1179,16 @@ async function boot() {
 
 /* URL overrides, so a view can be linked rather than described: ?flight=12
    picks the flight, ?axis=altitude opens the sounding view, ?theme=light pins a
-   chase-vehicle tablet to the sun-readable mode. */
+   chase-vehicle tablet to the sun-readable mode.
+
+   The same parameters Back restores, read the same way -- a link someone pastes
+   and a step backwards have to land on the same view. */
 const params = new URLSearchParams(location.search);
 
 if (params.get("axis") === "altitude") {
-  state.axis = "altitude";
-  document.querySelectorAll(".seg").forEach((b) =>
-    b.classList.toggle("active", b.dataset.axis === "altitude"));
+  setAxis("altitude");
 }
+state.domain = domainFromUrl(params, state.axis);
 
 const urlRange = rangeFromUrl();
 if (urlRange) {

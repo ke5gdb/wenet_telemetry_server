@@ -131,6 +131,25 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
   max-width: 210px;
 }
 
+.brand-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+
+/* On /KE5GDB the flight list is one transmitter's. Say so, and make it one
+   click to get back out -- a filter you cannot see is a filter you forget,
+   and then a flight looks missing. */
+.callsign-chip {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+  color: var(--series-1);
+  border: 1px solid var(--series-1);
+  border-radius: 999px;
+  padding: 1px 7px;
+  text-decoration: none;
+  white-space: nowrap;
+  flex: none;
+}
+.callsign-chip::after { content: " ✕"; color: var(--text-muted); }
+.callsign-chip:hover { background: var(--series-1); color: #fff; }
+.callsign-chip:hover::after { color: #fff; }
+
 /* Stat tiles: a single headline number is a tile, not a chart. */
 .tiles { display: flex; gap: 8px; flex: 1; flex-wrap: wrap; }
 

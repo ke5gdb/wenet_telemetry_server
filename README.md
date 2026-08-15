@@ -281,6 +281,19 @@ The gap is measured on the **reception** clock, never the payload's: a board
 with no PCF8523 restarts its RTC at 2021-01-01 on every power cycle, and judging
 silence against that would file a healthy flight under the wrong one.
 
+`{server}/KE5GDB` opens the display filtered to one transmitter — the flight
+list shows only its flights and it opens on the newest. That is the link to hand
+to the chase team: it needs no explanation of which entry to pick, and it works
+before the launch, opening on "Nothing from KE5GDB yet" and picking the flight
+up on its own when the first packet lands. A chip beside the flight selector
+shows the filter is on and clears it in one click.
+
+Matched case-insensitively, one path segment, letters, digits and hyphens.
+Portable suffixes (`KE5GDB/P`) are deliberately out — a stroke is a path
+separator, not part of a segment. **nginx needs the matching location block**
+from `deploy/nginx-wenet-telemetry.conf`, or the path 404s at the edge without
+ever reaching the app.
+
 Because several transmitters can be up at once, every batch also sweeps closed
 any flight that has gone quiet past the gap. Without that, a flight is only ever
 closed by traffic from its own transmitter, so one that lands or is switched off

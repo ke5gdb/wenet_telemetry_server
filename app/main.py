@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -450,3 +451,31 @@ async def backfill(flight_id: int, force: bool = False):
     written off as having no fix nearby.
     """
     return await asyncio.to_thread(get_store().backfill_altitudes, flight_id, None, force)
+
+
+# -- /KE5GDB --------------------------------------------------------------
+#
+# Declared last on purpose. FastAPI matches in declaration order, and this is a
+# single-segment catch-all: put earlier, it would shadow `/events`. Multi-segment
+# routes like /api/v1/... cannot collide with it, and neither can the /static
+# mount.
+
+#: What may appear as a callsign in a path. No dot, so /favicon.ico misses; no
+#: slash, so nothing multi-segment reaches here. Portable suffixes (KE5GDB/P)
+#: are deliberately out -- a stroke inside a path segment is a different URL.
+_CALLSIGN_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{2,15}$")
+
+if STATIC_DIR.is_dir():
+
+    @app.get("/{callsign}", include_in_schema=False)
+    async def index_for_callsign(callsign: str):
+        """The display, filtered to one transmitter.
+
+        Serves the same file as `/`; the page reads the callsign from its own
+        path. Deliberately not validated against the database -- a link to a
+        transmitter that has not flown yet should open and wait, which is the
+        normal case when the link is sent out before the launch.
+        """
+        if not _CALLSIGN_PATH.match(callsign):
+            raise HTTPException(404, "not found")
+        return FileResponse(STATIC_DIR / "index.html")

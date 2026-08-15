@@ -14,7 +14,13 @@
     <div>
       <h1 id="flight-name" tabindex="0" role="button"
           title="Click to rename">Wenet Telemetry</h1>
-      <select id="flight-select" aria-label="Flight"></select>
+      <div class="brand-row">
+        <select id="flight-select" aria-label="Flight"></select>
+        <!-- Shown only on /CALLSIGN, where the flight list is filtered to one
+             transmitter. Links back to the unfiltered display. -->
+        <a class="callsign-chip" id="callsign-chip" href="/" hidden
+           title="Showing one transmitter — click for all flights"></a>
+      </div>
     </div>
   </div>
 

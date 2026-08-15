@@ -174,6 +174,36 @@ def test_live_push_is_split_per_flight(client, monkeypatch):
     assert mine["gps"][0]["alt"] == 18422.0
 
 
+def test_callsign_path_serves_the_display(client):
+    """`{server}/KE5GDB` is a link you can hand to the chase team."""
+    resp = client.get("/KE5GDB")
+
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    # The same file as `/`; the filtering happens in the page.
+    assert resp.text == client.get("/").text
+
+
+def test_callsign_path_does_not_have_to_exist_yet(client):
+    """The link goes out before the launch, so it must open and wait."""
+    assert client.get("/W5NOTFLOWNYET").status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/favicon.ico", "/a", "/this-name-is-far-too-long-x"])
+def test_non_callsign_paths_are_not_the_display(client, path):
+    assert client.get(path).status_code == 404
+
+
+def test_callsign_route_does_not_shadow_the_api(client):
+    """It is declared last for this reason; a single segment could eat /events."""
+    assert client.get("/api/v1/health").status_code == 200
+    assert client.get("/api/v1/flights").status_code == 200
+    # Routed to the SSE endpoint rather than the display. Not read here: the
+    # generator only ends on client disconnect, which TestClient cannot signal.
+    route = next(r for r in main.app.routes if getattr(r, "path", None) == "/events")
+    assert route.endpoint.__name__ == "events"
+
+
 def test_packet_without_raw_or_data_is_a_validation_error(client):
     resp = client.post("/api/v1/ingest", json={"packets": [{"kind": "sensor"}]})
     assert resp.status_code == 422
