@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS sources (
   first_seen   TEXT NOT NULL,
   last_seen    TEXT NOT NULL,
   packet_count INTEGER NOT NULL DEFAULT 0,
+  -- 'sensor' for a BLE payload's board, 'gps' for the transmitter's own
+  -- telemetry, which is filed as a source so its housekeeping can be charted
+  -- like anything else. Recorded rather than inferred from the name: a BLE
+  -- board is perfectly entitled to call itself GPS, and the altitude backfill
+  -- must not treat that one as authoritative.
+  kind         TEXT NOT NULL DEFAULT 'sensor',
   UNIQUE(flight_id, source_key)
 );
 

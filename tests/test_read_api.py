@@ -195,12 +195,18 @@ def test_latest_reports_current_state(store):
     assert out["gps"]["altitude"] == pytest.approx(200.0 + 5.0 * 98)
     assert out["peak_altitude"] == pytest.approx(200.0 + 5.0 * 98)
 
-    (src,) = out["sources"]
-    assert src["source_key"] == "RAB_HAT_ENV"
+    by_key = {s["source_key"]: s for s in out["sources"]}
+    src = by_key["RAB_HAT_ENV"]
     assert src["count"] == 99
     assert src["data"]["bmp_temp"] == pytest.approx(15.0 - 99 * 0.05)
     assert src["altitude"] is not None
     assert src["rate_hz"] == pytest.approx(1.0, abs=0.05)
+
+    # The transmitter's own telemetry reports as a source alongside it, so the
+    # display can show battery and CPU temperature on the same footing as the
+    # BLE sensors rather than burying them in the map layer.
+    wenet = by_key["WENET_GPS"]
+    assert wenet["data"]["altitude"] == pytest.approx(200.0 + 5.0 * 98)
 
 
 def test_reporters_counts_gps_receptions_too(store):
@@ -353,7 +359,9 @@ def test_ingest_publishes_a_live_update(client):
     assert event["sources"]["RAB_HAT_ENV"]["data"]["bmp_temp"] == -54.2
     assert event["sources"]["RAB_HAT_ENV"]["count"] == 7
     assert event["gps"][0]["alt"] == 18422.0
-    assert event["new_sources"] == ["RAB_HAT_ENV"]
+    # The GPS telemetry source is discovered by the same batch.
+    assert event["new_sources"] == ["RAB_HAT_ENV", "WENET_GPS"]
+    assert event["sources"]["WENET_GPS"]["data"]["altitude"] == 18422.0
 
 
 def test_live_update_carries_only_the_newest_sample_per_source(client):

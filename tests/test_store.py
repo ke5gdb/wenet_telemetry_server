@@ -226,6 +226,145 @@ def test_two_generic_payloads_stay_apart(store):
     assert scalar(store, "SELECT COUNT(*) FROM flights") == 1
 
 
+# -- GPS telemetry is a source, not just a map point ----------------------
+
+
+#: Everything a 2025-firmware Wenet transmitter reports about itself, as
+#: `gps_telemetry_decoder` in the forwarder builds it.
+FULL_GPS = {
+    "week": 2378, "iTOW": 259200.0, "leapS": 18,
+    "latitude": 32.9, "longitude": -97.2, "altitude": 18422.0,
+    "ground_speed": 12.4, "heading": 271.0, "ascent_rate": 5.1,
+    "numSV": 9, "gpsFix": 3, "dynamic_model": 6,
+    "radio_temp": 41.2, "cpu_temp": 55.8, "cpu_speed": 1500,
+    "load_avg_1": 0.71, "load_avg_5": 0.66, "load_avg_15": 0.6,
+    "disk_percent": 43.2, "lens_position": 0.25, "sensor_temp": 38.9,
+    "focus_fom": 812,
+    "batt_v": 7.94, "batt_i": 415, "aux_temp": -21.4,
+    "gpsFix_str": "3D Fix", "error": None,
+}
+
+
+def full_gps(offset_s=0.0, callsign="KE5GDB", **overrides):
+    data = {**FULL_GPS, "timestamp": iso(T0 + timedelta(seconds=offset_s)), **overrides}
+    return {"kind": "gps", "payload_callsign": callsign, "data": data}
+
+
+def test_gps_housekeeping_becomes_chartable_fields(store):
+    """Battery, CPU and camera health are telemetry, not map furniture."""
+    store.ingest("KE5GDB", [full_gps()])
+
+    source = rows(store, "SELECT * FROM sources WHERE kind='gps'")[0]
+    assert source["source_key"] == "KE5GDB_GPS"
+    assert source["payload_name"] == "KE5GDB"
+    assert source["task_name"] == "GPS"
+
+    fields = {r["name"]: r for r in rows(
+        store, "SELECT * FROM fields WHERE source_id=?", (source["id"],))}
+    assert {"batt_v", "batt_i", "cpu_temp", "radio_temp", "cpu_speed",
+            "load_avg_1", "disk_percent", "lens_position", "focus_fom",
+            "aux_temp", "numSV", "altitude"} <= set(fields)
+    assert fields["batt_v"]["unit"] == "V"
+    assert fields["cpu_temp"]["unit"] == "°C"
+    # The decoded fix state is text, so it lists but does not chart.
+    assert fields["gpsFix_str"]["kind"] == "text"
+
+    values = dict(rows(store, "SELECT f.name, r.value FROM readings r "
+                              "JOIN fields f ON f.id=r.field_id"))
+    assert values["batt_v"] == 7.94
+    assert values["cpu_temp"] == 55.8
+
+
+def test_packet_envelope_is_not_charted(store):
+    """The week/second pair is the timestamp in raw form, not a measurement."""
+    store.ingest("KE5GDB", [full_gps()])
+
+    charted = {r[0] for r in rows(store, "SELECT name FROM fields")}
+    assert charted.isdisjoint({"week", "iTOW", "leapS", "error", "time_source"})
+
+
+def test_gps_telemetry_is_stored_once_however_many_stations_hear_it(store):
+    fix = full_gps()
+    store.ingest("KE5GDB", [fix])
+    store.ingest("K5NBC", [fix])
+    store.ingest("W5ABC", [fix])
+
+    assert scalar(store, "SELECT COUNT(*) FROM packets") == 1
+    assert scalar(store, "SELECT COUNT(*) FROM gps") == 1
+    assert scalar(store, "SELECT COUNT(*) FROM gps_receptions") == 3
+    # Counted as GPS receptions only. A row in `receptions` as well would make
+    # the reporters tally count every fix twice.
+    assert scalar(store, "SELECT COUNT(*) FROM receptions") == 0
+
+
+def test_gps_packet_resolves_its_own_altitude(store):
+    """It is a fix; there is nothing to interpolate it from but itself."""
+    store.ingest("KE5GDB", [full_gps()])
+
+    row = rows(store, "SELECT altitude, altitude_resolved FROM packets")[0]
+    assert row["altitude"] == 18422.0
+    assert row["altitude_resolved"] == 1
+
+
+def test_forced_backfill_keeps_a_gps_packet_s_own_altitude(store):
+    """Force reconsiders interpolations. This is a measurement, not one."""
+    store.ingest("KE5GDB", [full_gps(0), full_gps(10, altitude=18500.0)])
+    store.backfill_altitudes(1, force=True, flush=True)
+
+    alts = sorted(r[0] for r in rows(store, "SELECT altitude FROM packets"))
+    assert alts == [18422.0, 18500.0]
+
+
+def test_a_fixless_gps_packet_still_carries_its_housekeeping(store):
+    """No lock is exactly when the transmitter's own health matters most."""
+    store.ingest("KE5GDB", [full_gps(
+        latitude=None, longitude=None, altitude=None, numSV=0,
+        gpsFix=0, gpsFix_str="No Fix",
+    )])
+
+    values = dict(rows(store, "SELECT f.name, r.value FROM readings r "
+                              "JOIN fields f ON f.id=r.field_id"))
+    assert values["batt_v"] == 7.94
+    assert values["cpu_temp"] == 55.8
+    assert "altitude" not in values          # nothing to record, not a zero
+
+
+def test_materialize_backfills_gps_telemetry_already_stored(store):
+    """A flight ingested before GPS packets were filed as a source."""
+    store.ingest("KE5GDB", [full_gps(0), full_gps(1)])
+    # Strip it back to the pre-change shape: fix rows only.
+    conn = store.pool.get()
+    with conn:
+        conn.execute("DELETE FROM sources WHERE kind='gps'")
+    store._source_cache.clear()
+    store._field_cache.clear()
+    assert scalar(store, "SELECT COUNT(*) FROM packets") == 0
+
+    out = store.materialize_gps_telemetry(1)
+
+    assert out["gps_rows"] == 2
+    assert out["packets_created"] == 2
+    values = dict(rows(store, "SELECT f.name, r.value FROM readings r "
+                              "JOIN fields f ON f.id=r.field_id LIMIT 100"))
+    assert values["batt_v"] == 7.94
+    assert values["cpu_temp"] == 55.8
+    assert scalar(store, "SELECT payload_name FROM sources WHERE kind='gps'") == "KE5GDB"
+
+    # Idempotent: running it again writes nothing.
+    again = store.materialize_gps_telemetry(1)
+    assert again["packets_created"] == 0
+    assert scalar(store, "SELECT COUNT(*) FROM packets") == 2
+
+
+def test_two_transmitters_get_their_own_telemetry_sources(store):
+    store.ingest("KE5GDB", [full_gps(callsign="KE5GDB"),
+                            full_gps(callsign="W5XYZ")])
+
+    keys = sorted(r[0] for r in rows(
+        store, "SELECT source_key FROM sources WHERE kind='gps'"))
+    assert keys == ["KE5GDB_GPS", "W5XYZ_GPS"]
+
+
 # -- flights are one transmitter's up-burst-down --------------------------
 
 
@@ -566,7 +705,11 @@ def test_no_fix_packets_cannot_corrupt_an_interpolated_altitude(store):
     store.ingest("KE5GDB", [packet(count=1, offset_s=5, bmp_temp=-40.0)])
     store.backfill_altitudes(1, flush=True)
 
-    assert scalar(store, "SELECT altitude FROM packets") == 1050.0
+    assert scalar(
+        store,
+        "SELECT p.altitude FROM packets p JOIN sources s ON s.id=p.source_id "
+        "WHERE s.kind != 'gps'",
+    ) == 1050.0
 
 
 def test_no_fix_packets_do_not_skew_the_peak(store):
@@ -635,6 +778,8 @@ def test_gps_shares_the_flight_with_sensor_data(store):
     store.ingest("KE5GDB", [packet(count=1, bmp_temp=-54.2), gps()])
 
     flight = store.flights()[0]
-    assert flight["packet_count"] == 1
+    # The sensor packet, and the GPS packet filed a second time as a source of
+    # its own so its housekeeping is chartable.
+    assert flight["packet_count"] == 2
     assert flight["gps_count"] == 1
     assert scalar(store, "SELECT flight_id FROM gps") == flight["id"]

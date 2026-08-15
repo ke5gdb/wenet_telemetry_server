@@ -41,11 +41,19 @@ def gps(offset_s, altitude):
     }
 
 
+#: GPS telemetry is stored as a source of its own, so `packets` holds those too.
+#: They are resolved on arrival against their own fix and are not what the
+#: interpolation is being tested on -- these tests are about sensor packets
+#: reaching backwards and forwards to a track.
+SENSOR_ONLY = "JOIN sources s ON s.id = p.source_id WHERE s.kind != 'gps'"
+
+
 def altitudes(store):
     return [
         (r["count"], r["altitude"], r["altitude_resolved"])
         for r in store.pool.get().execute(
-            "SELECT count, altitude, altitude_resolved FROM packets ORDER BY time_epoch"
+            "SELECT p.count, p.altitude, p.altitude_resolved FROM packets p "
+            f"{SENSOR_ONLY} ORDER BY p.time_epoch"
         )
     ]
 

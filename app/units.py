@@ -68,12 +68,24 @@ UNITS: dict[str, tuple[str, str]] = {
     "ground_speed": ("m/s", "Horizontal speed"),
     "heading": ("°", "Course over ground"),
     "numSV": ("", "Satellites used in solution"),
+    "gpsFix": ("", "Fix type: 0 none, 2 2D, 3 3D, 5 time only"),
+    "gpsFix_str": ("", "Fix type, decoded"),
+    "dynamic_model": ("", "u-blox dynamic platform model"),
     "batt_v": ("V", "Wenet payload battery"),
     "batt_i": ("mA", "Wenet payload current"),
     "cpu_temp": ("°C", "Wenet payload CPU"),
     "radio_temp": ("°C", "Wenet payload radio"),
     "sensor_temp": ("°C", "Wenet camera sensor"),
     "aux_temp": ("°C", "Wenet auxiliary sensor"),
+    # Housekeeping the Wenet transmitter reports about itself. Thermal
+    # throttling on the ascent shows up here before it shows up anywhere else.
+    "cpu_speed": ("MHz", "Wenet payload CPU clock"),
+    "load_avg_1": ("", "Load average, 1 minute"),
+    "load_avg_5": ("", "Load average, 5 minutes"),
+    "load_avg_15": ("", "Load average, 15 minutes"),
+    "disk_percent": ("%", "Root filesystem used"),
+    "lens_position": ("1/m", "Camera lens position, dioptres"),
+    "focus_fom": ("", "Camera focus figure of merit"),
 }
 
 #: Fields that describe the packet rather than measure anything. They are kept

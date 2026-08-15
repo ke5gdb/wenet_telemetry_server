@@ -25,6 +25,27 @@ from .units import RESERVED, field_meta
 
 log = logging.getLogger(__name__)
 
+#: A GPS telemetry packet is a sensor packet that happens to carry a position.
+#: Besides the fix it reports the transmitter's own health -- CPU and radio
+#: temperature, clock, load, disk, battery volts and amps, camera focus -- and
+#: none of that is visible if it is only ever filed as a map point. So the same
+#: packet is also stored as a source, with fields and readings, exactly like a
+#: CBOR packet from a BLE payload: chartable, exportable, and in the source
+#: list beside everything else.
+#:
+#: These keys are the exception, describing the packet rather than measuring
+#: anything. The week/second pair is the timestamp in its raw form and would
+#: plot as a sawtooth; `time_source` is the server's own note about which clock
+#: was used; `error` is the decoder's status, and is None on every packet that
+#: got this far.
+_GPS_NOT_A_SERIES = frozenset({
+    "timestamp", "time", "week", "iTOW", "leapS", "error", "time_source",
+})
+
+#: Task name for that synthesised source. The payload name is the transmitter's
+#: callsign where the receiver gave one.
+_GPS_TASK = "GPS"
+
 #: Columns of the GPS table that arrive as named fields; anything else in a GPS
 #: packet is preserved in `extra` rather than dropped.
 _GPS_COLUMNS = {
@@ -395,6 +416,14 @@ class Store:
         for name, value in data.items():
             if name in RESERVED:
                 continue
+            if value is None:
+                # Absent, not textual. A field's kind is fixed when it is first
+                # discovered and never upgraded, so registering a null as text
+                # would make it text for the life of the flight -- and a GPS
+                # packet taken before the receiver locked carries null
+                # latitude, longitude and altitude, which is precisely the
+                # first packet of most flights.
+                continue
             if isinstance(value, bool):
                 numeric: float | None = float(value)
             elif isinstance(value, (int, float)):
@@ -492,17 +521,157 @@ class Store:
                 "num_sv": values.get("num_sv"),
                 "flight_id": flight_id,
             })
+            # Only for the station that got here first. The others are receive
+            # diversity, recorded below -- storing the series once is the same
+            # rule the sensor path follows.
+            self._store_gps_telemetry(
+                conn, flight_id, callsign, data, ts, received_at, result
+            )
         else:
             gps_id = conn.execute(
                 "SELECT id FROM gps WHERE flight_id=? AND timestamp=?", (flight_id, ts)
             ).fetchone()[0]
             result.gps_duplicates += 1
 
+        # Deliberately `gps_receptions` and not `receptions`: the reporters
+        # tally unions both tables, so a row in each would count every GPS
+        # reception twice, once as sensor and once as GPS.
         conn.execute(
             "INSERT OR IGNORE INTO gps_receptions(gps_id, reporter_id, received_at) "
             "VALUES (?,?,?)",
             (gps_id, reporter_id, received_at),
         )
+
+    def gps_source_key(self, callsign: str | None) -> str:
+        """Key for the synthesised source carrying GPS telemetry as series.
+
+        Qualified with the callsign where there is one, which is safe because a
+        flight *is* one transmitter -- the callsign cannot change inside a
+        flight, since a different one resolves to a different flight.
+        """
+        return f"{callsign}_{_GPS_TASK}" if callsign else f"WENET_{_GPS_TASK}"
+
+    def _store_gps_telemetry(
+        self,
+        conn: sqlite3.Connection,
+        flight_id: int,
+        callsign: str | None,
+        data: dict,
+        ts: str,
+        received_at: str,
+        result: IngestResult,
+    ) -> bool:
+        """File a GPS packet a second time, as a source with chartable fields.
+
+        The fix itself is already in `gps`, which is what the map and the
+        altitude backfill read. This is the rest of the packet -- the
+        transmitter's own housekeeping -- which has nowhere else to live: it
+        would otherwise sit in the `extra` JSON blob, stored but unplottable
+        and invisible in the source list.
+        """
+        series = {k: v for k, v in data.items() if k not in _GPS_NOT_A_SERIES}
+        if not series:
+            return False
+
+        source_key = self.gps_source_key(callsign)
+        source_id = self._get_source(
+            conn, flight_id, source_key, data, ts, result,
+            names=(callsign or "Wenet", _GPS_TASK), kind="gps",
+        )
+
+        # This packet *is* a fix, so its altitude needs no interpolating -- it
+        # is resolved on arrival, against itself. A packet that came in without
+        # one is left pending instead, so the backfill can reach it from the
+        # surrounding track: "no fix here" is exactly when plotting the
+        # transmitter's housekeeping against altitude still matters.
+        own_altitude = data.get("altitude")
+        if not isinstance(own_altitude, (int, float)) or isinstance(own_altitude, bool):
+            own_altitude = None
+
+        # `count` is a sensor-packet concept; GPS has no sequence number, so the
+        # dedup key falls back to (source, time), which is exactly the key the
+        # `gps` table already enforces.
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO packets"
+            "(source_id, payload_time, count, time_epoch, data, raw_cbor, truncated,"
+            " first_heard, payload_callsign, altitude, altitude_resolved) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                source_id, ts, -1, to_epoch(ts), json.dumps(data, default=str),
+                None, 0, received_at, callsign,
+                own_altitude, 1 if own_altitude is not None else 0,
+            ),
+        )
+        if not cur.rowcount:
+            return False
+
+        self._store_readings(conn, source_id, cur.lastrowid, ts, series, result)
+        conn.execute(
+            "UPDATE sources SET last_seen=MAX(last_seen, ?), "
+            "packet_count=packet_count+1 WHERE id=?",
+            (ts, source_id),
+        )
+        previous = result.latest.get(source_key)
+        if previous is None or ts > previous["time"]:
+            result.latest[source_key] = {
+                "time": ts,
+                "count": -1,
+                "truncated": False,
+                "data": series,
+                "flight_id": flight_id,
+            }
+        return True
+
+    #: gps table column -> the key the packet arrived with, for reconstructing a
+    #: decoded packet from a stored row.
+    _GPS_ROW_KEYS = {
+        "latitude": "latitude", "longitude": "longitude", "altitude": "altitude",
+        "ascent_rate": "ascent_rate", "ground_speed": "ground_speed",
+        "heading": "heading", "num_sv": "numSV", "gps_fix": "gpsFix",
+    }
+
+    def materialize_gps_telemetry(self, flight_id: int) -> dict:
+        """Build the GPS telemetry source for a flight already in the store.
+
+        For databases written before GPS packets were filed as a source: the
+        housekeeping is all there, sitting in the `extra` blob where nothing can
+        chart it. Idempotent -- the packet insert is keyed on (source, time), so
+        re-running adds nothing and a partially-done flight finishes cleanly.
+        """
+        conn = self.pool.get()
+        result = IngestResult()
+        created = 0
+
+        with self._write_lock, conn:
+            rows = conn.execute(
+                "SELECT * FROM gps WHERE flight_id=? ORDER BY time_epoch", (flight_id,)
+            ).fetchall()
+
+            for row in rows:
+                try:
+                    extra = json.loads(row["extra"] or "{}")
+                except ValueError:
+                    extra = {}
+                data = {k: v for k, v in extra.items() if k != "time_source"}
+                for column, key in self._GPS_ROW_KEYS.items():
+                    if row[column] is not None:
+                        data[key] = row[column]
+
+                if self._store_gps_telemetry(
+                    conn, flight_id, row["payload_callsign"], data,
+                    row["timestamp"], row["first_heard"], result,
+                ):
+                    created += 1
+
+        self._source_cache.clear()
+        self._field_cache.clear()
+        log.info("flight %s: materialised %d GPS telemetry packets", flight_id, created)
+        return {
+            "flight_id": flight_id,
+            "gps_rows": len(rows),
+            "packets_created": created,
+            "fields": sorted(set(result.new_fields)),
+        }
 
     # -- altitude backfill ------------------------------------------------
 
@@ -528,9 +697,14 @@ class Store:
 
         with self._write_lock, conn:
             if force:
+                # Not the GPS source: its altitudes are its own measurements,
+                # not interpolations, so clearing them would throw away the one
+                # figure that never needed reconsidering -- and the last packet,
+                # with no fix past it, would never be resolved again.
                 conn.execute(
                     "UPDATE packets SET altitude=NULL, altitude_resolved=0 "
-                    "WHERE source_id IN (SELECT id FROM sources WHERE flight_id=?)",
+                    "WHERE source_id IN (SELECT id FROM sources "
+                    "WHERE flight_id=? AND kind != 'gps')",
                     (flight_id,),
                 )
 
@@ -681,6 +855,8 @@ class Store:
         data: dict,
         payload_time: str,
         result: IngestResult,
+        names: tuple[str, str] | None = None,
+        kind: str = "sensor",
     ) -> int:
         cached = self._source_cache.get((flight_id, source_key))
         if cached is not None:
@@ -692,12 +868,15 @@ class Store:
         ).fetchone()
 
         if row is None:
-            payload_name, task_name = derive_names(source_key, data)
+            # `names` is for the synthesised GPS source, whose identity comes
+            # from the transmitter rather than from anything inside the packet.
+            payload_name, task_name = names or derive_names(source_key, data)
             cur = conn.execute(
                 "INSERT INTO sources"
-                "(flight_id, source_key, payload_name, task_name, first_seen, last_seen) "
-                "VALUES (?,?,?,?,?,?)",
-                (flight_id, source_key, payload_name, task_name, payload_time, payload_time),
+                "(flight_id, source_key, payload_name, task_name, first_seen, last_seen,"
+                " kind) VALUES (?,?,?,?,?,?,?)",
+                (flight_id, source_key, payload_name, task_name, payload_time,
+                 payload_time, kind),
             )
             source_id = cur.lastrowid
             result.new_sources.append(source_key)

@@ -49,6 +49,9 @@ _ADDED_COLUMNS = [
     ("flights", "payload_callsign", "TEXT"),
     ("packets", "payload_callsign", "TEXT"),
     ("gps", "payload_callsign", "TEXT"),
+    # Every source that predates this is a sensor source, which is what the
+    # default says -- so no backfill is needed here either.
+    ("sources", "kind", "TEXT NOT NULL DEFAULT 'sensor'"),
 ]
 
 #: Unix epoch as a Julian day number, for converting stored ISO text in SQL.

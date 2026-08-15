@@ -94,10 +94,18 @@ def test_csv_long_covers_every_source(store):
     populate(store)
     rows = list(csv.DictReader(io.StringIO(collect(export.csv_long(store.pool.path, 1)))))
 
-    assert {r["source"] for r in rows} == {"GDB_ENV_ENV", "GDB_ENV_LSM6DSOX"}
-    assert {r["field"] for r in rows} == {"hdc_temp", "hdc_humi", "v_in", "a_x", "imu_temp"}
+    # The transmitter's own telemetry exports alongside the BLE payloads': it
+    # is a source like any other, so "every source" includes it.
+    assert {r["source"] for r in rows} == {
+        "GDB_ENV_ENV", "GDB_ENV_LSM6DSOX", "WENET_GPS"
+    }
+    assert {r["field"] for r in rows} >= {"hdc_temp", "hdc_humi", "v_in", "a_x", "imu_temp"}
     temp = next(r for r in rows if r["field"] == "hdc_temp")
     assert temp["unit"] == "°C"
+
+    gps_rows = [r for r in rows if r["source"] == "WENET_GPS"]
+    assert {r["field"] for r in gps_rows} >= {"latitude", "longitude", "altitude"}
+    assert next(r for r in gps_rows if r["field"] == "altitude")["unit"] == "m"
 
 
 def test_csv_gps_export(store):
@@ -122,7 +130,9 @@ def test_jsonl_matches_the_analysis_log_shape(store):
     populate(store)
     lines = collect(export.jsonl(store.pool.path, 1)).strip().split("\n")
 
-    assert len(lines) == 40
+    # 40 sensor packets and the 20 GPS telemetry packets, which are exported as
+    # packets because that is what they are.
+    assert len(lines) == 60
     record = json.loads(lines[0])
     assert set(record) >= {"time", "id", "count"}
     assert record["id"] in ("GDB_ENV_ENV", "GDB_ENV_LSM6DSOX")
@@ -186,7 +196,7 @@ def test_database_snapshot_is_a_usable_database(store, tmp_path):
 
     import sqlite3
     conn = sqlite3.connect(out)
-    assert conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0] == 40
+    assert conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0] == 60
     assert conn.execute("SELECT COUNT(*) FROM gps").fetchone()[0] == 20
     conn.close()
 
@@ -210,12 +220,17 @@ def test_rename_and_note_a_flight(store):
 
 def test_close_flight_resolves_its_tail(store):
     store.ingest("KE5GDB", [gps(0, 1000.0), gps(10, 1100.0), sensor(1, 12, v_in=4.0)])
+    # The sensor packet specifically: a GPS telemetry packet is resolved on
+    # arrival against its own fix and would never be pending.
     assert store.pool.get().execute(
-        "SELECT altitude_resolved FROM packets").fetchone()[0] == 0
+        "SELECT p.altitude_resolved FROM packets p JOIN sources s ON s.id=p.source_id "
+        "WHERE s.kind != 'gps'").fetchone()[0] == 0
 
     store.close_flight(1)
 
-    row = store.pool.get().execute("SELECT altitude, altitude_resolved FROM packets").fetchone()
+    row = store.pool.get().execute(
+        "SELECT p.altitude, p.altitude_resolved FROM packets p "
+        "JOIN sources s ON s.id=p.source_id WHERE s.kind != 'gps'").fetchone()
     assert row["altitude_resolved"] == 1
     assert row["altitude"] == 1100.0
     assert store.flights()[0]["ended_at"] is not None
@@ -231,14 +246,17 @@ def test_merge_undoes_a_wrongly_split_flight(store):
 
     result = store.merge_flights(1, 2)
 
-    assert result["merged_sources"] == 1
+    # The BLE payload's source and the transmitter's GPS telemetry source, both
+    # folded onto their twins on the other side of the gap.
+    assert result["merged_sources"] == 2
     flights = store.flights()
     assert len(flights) == 1
     assert flights[0]["id"] == 1
-    assert flights[0]["packet_count"] == 2
+    assert flights[0]["packet_count"] == 4      # two sensor, two GPS telemetry
     assert flights[0]["gps_count"] == 2
-    # One source, not two -- the same payload on both sides of the gap.
-    assert len(store.sources(1)) == 1
+    # Two sources, not four -- the same payload and the same transmitter on
+    # both sides of the gap.
+    assert len(store.sources(1)) == 2
 
 
 def test_merge_keeps_readings_attached_to_their_fields(store):
@@ -279,10 +297,12 @@ def test_split_cuts_a_flight_in_two(store):
 
     result = store.split_flight(1, cut)
 
-    assert result["moved_packets"] == 20
+    # 40 sensor packets and 20 GPS telemetry packets. Past the cut: 20 sensor
+    # (t=10..19 on two sources) and 15 GPS (t=10,12..38).
+    assert result["moved_packets"] == 35
     flights = {f["id"]: f for f in store.flights()}
-    assert flights[1]["packet_count"] == 20
-    assert flights[result["new_flight_id"]]["packet_count"] == 20
+    assert flights[1]["packet_count"] == 25
+    assert flights[result["new_flight_id"]]["packet_count"] == 35
     assert flights[1]["ended_at"] == cut
 
 

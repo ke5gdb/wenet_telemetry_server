@@ -82,6 +82,42 @@ the plot shows an honest gap. A packet is only resolved once GPS exists past it
 by a full window — until then a nearer fix may still arrive — and the tail of a
 flight is flushed when the flight closes.
 
+## The transmitter's own telemetry
+
+A Wenet GPS packet is not only a fix. It also reports the transmitter's health —
+radio and CPU temperature, CPU clock, load averages, disk, camera lens position
+and focus figure of merit, battery volts and amps, an auxiliary temperature.
+Filed only as a map point, all of that ends up in the `gps.extra` blob: stored,
+exported, and impossible to plot.
+
+So the same packet is stored twice, on purpose. The fix goes to `gps`, which is
+what the map and the altitude backfill read. The whole packet is *also* filed as
+a source (`kind='gps'`, named for the transmitter's callsign) with fields and
+readings, exactly like a CBOR packet from a BLE payload — so thermal throttling
+on the ascent, or a battery sagging in the cold, charts beside the sensors
+instead of hiding in a JSON column.
+
+Consequences worth knowing:
+
+- `packets` and the packet tally now include GPS telemetry packets. They are
+  packets, and the exports carry them.
+- Only the first station to report a fix writes the series; the rest are receive
+  diversity, recorded in `gps_receptions`. A row in `receptions` too would make
+  the reporters tally count every fix twice.
+- These packets need no altitude interpolation — they *are* the fix, so they are
+  resolved on arrival against themselves, and `--force` leaves them alone.
+- The week/second pair, `time_source` and the decoder's `error` are not
+  registered as series: they describe the packet rather than measure anything.
+
+For flights already in the store, `tools/materialize_gps.py` backfills the same
+thing from the rows and the blob. It is idempotent, so an interrupted run
+finishes cleanly on the next:
+
+```bash
+python tools/materialize_gps.py --list      # what each flight would gain
+python tools/materialize_gps.py --all
+```
+
 ## Quick start
 
 ```bash
