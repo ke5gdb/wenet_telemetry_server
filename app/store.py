@@ -46,6 +46,40 @@ _GPS_NOT_A_SERIES = frozenset({
 #: callsign where the receiver gave one.
 _GPS_TASK = "GPS"
 
+#: How many packets the reported rate is measured over.
+#:
+#: A count of packets in a fixed 60 s window was the obvious thing and the wrong
+#: one: sources here run anywhere from 0.05 Hz to 2 Hz, and one window cannot
+#: serve both. At 2 Hz it averages away a minute of detail; at 0.05 Hz it counts
+#: three packets and quantises the answer to a third of itself.
+#:
+#: Measuring over a fixed number of packets is scale-free -- the window becomes
+#: however long those packets took -- so the same constant reads a fast source
+#: and a slow one equally well. 20 is a compromise: ~10 s at 2 Hz, responsive
+#: enough to show a link degrading, long enough that one dropped packet moves
+#: the figure by 5% rather than 10%.
+RATE_SAMPLES = 20
+
+
+def rate_from_epochs(epochs: list[float]) -> float:
+    """Packets per second across a run of packets, newest first.
+
+    Intervals, not a count over a window: `n` packets span `n-1` gaps, and
+    dividing by the elapsed time between the first and last is the rate at which
+    they actually arrived. Losses are in the answer rather than smoothed out of
+    it -- a display of received rate should say when half of them stopped
+    arriving.
+    """
+    if len(epochs) < 2:
+        return 0.0
+    span = epochs[0] - epochs[-1]
+    # Packets are unique on (source, time, count), so several can legitimately
+    # share a timestamp -- a truncated packet loses its count and a payload with
+    # a coarse clock can emit two in the same second. No span, no rate.
+    if span <= 0:
+        return 0.0
+    return (len(epochs) - 1) / span
+
 #: Columns of the GPS table that arrive as named fields; anything else in a GPS
 #: packet is preserved in `extra` rather than dropped.
 _GPS_COLUMNS = {
@@ -1209,20 +1243,23 @@ class Store:
             "SELECT * FROM sources WHERE flight_id=? ORDER BY payload_name, task_name",
             (flight_id,),
         ):
-            packet = conn.execute(
+            # One query for both the newest packet and the rate: the rate is
+            # measured over the newest few, so they are the same rows.
+            recent = conn.execute(
                 "SELECT payload_time, time_epoch, count, data, truncated, altitude, "
                 "       first_heard "
-                "FROM packets WHERE source_id=? ORDER BY time_epoch DESC LIMIT 1",
-                (src["id"],),
-            ).fetchone()
-            if packet is None:
+                "FROM packets WHERE source_id=? ORDER BY time_epoch DESC LIMIT ?",
+                (src["id"], RATE_SAMPLES),
+            ).fetchall()
+            if not recent:
                 continue
-            # Rate over the last minute of the source's own clock, so a stalled
-            # source reads 0 rather than inheriting the last known rate.
-            recent = conn.execute(
-                "SELECT COUNT(*) FROM packets WHERE source_id=? AND time_epoch>?",
-                (src["id"], packet["time_epoch"] - 60.0),
-            ).fetchone()[0]
+            packet = recent[0]
+            # Measured on the source's own clock. Wall-clock would read zero
+            # forever on a payload whose RTC restarts at 2021-01-01 for want of
+            # a PCF8523 -- and that source is perfectly healthy. Whether it is
+            # still transmitting is a separate question, answered by
+            # `heard_epoch` against the server clock.
+            rate_hz = rate_from_epochs([row["time_epoch"] for row in recent])
             sources.append({
                 "source_key": src["source_key"],
                 "payload_name": src["payload_name"],
@@ -1240,7 +1277,7 @@ class Store:
                 "count": packet["count"],
                 "truncated": bool(packet["truncated"]),
                 "altitude": packet["altitude"],
-                "rate_hz": round(recent / 60.0, 3),
+                "rate_hz": round(rate_hz, 3),
                 "data": json.loads(packet["data"]),
             })
 

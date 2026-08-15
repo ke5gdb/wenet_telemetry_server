@@ -188,6 +188,81 @@ def test_track_thins_a_long_flight(store):
     assert len(t["lat"]) == 50
 
 
+# -- reported rate --------------------------------------------------------
+
+
+def rate_of(store, source_key="RAB_HAT_ENV"):
+    return next(s["rate_hz"] for s in store.latest(1)["sources"]
+                if s["source_key"] == source_key)
+
+
+@pytest.mark.parametrize("interval, expected", [
+    (0.5, 2.0),      # sensors
+    (1.0, 1.0),      # GPS
+    (1.25, 0.8),     # the X-RPT rate seen in the field
+])
+def test_rate_matches_the_packet_interval(store, interval, expected):
+    store.ingest("KE5GDB", [
+        sensor(i, i * interval, v_in=4.0) for i in range(30)
+    ])
+    assert rate_of(store) == pytest.approx(expected, rel=0.01)
+
+
+def test_a_slow_source_is_measured_accurately(store):
+    """What the fixed 60 s window could not do.
+
+    At one packet every 20 s it saw three of them, so the answer could only be a
+    multiple of 1/60 -- 0.05 Hz reported as 0.033 or 0.067. Measuring over a
+    fixed number of packets stretches the window instead.
+    """
+    store.ingest("KE5GDB", [sensor(i, i * 20.0, v_in=4.0) for i in range(25)])
+    assert rate_of(store) == pytest.approx(0.05, rel=0.01)
+
+
+def test_rate_is_measured_over_the_newest_packets_only(store):
+    """A source that speeds up should read fast, not the average of its life."""
+    slow = [sensor(i, i * 10.0, v_in=4.0) for i in range(30)]          # 0.1 Hz
+    fast = [sensor(30 + i, 300.0 + i * 0.5, v_in=4.0) for i in range(30)]  # 2 Hz
+    store.ingest("KE5GDB", slow + fast)
+
+    assert rate_of(store) == pytest.approx(2.0, rel=0.05)
+
+
+def test_lost_packets_lower_the_reported_rate(store):
+    """The figure is the rate packets are *arriving*, not the payload's nominal
+    rate -- half of them going missing is the thing worth seeing."""
+    every_other = [sensor(i, i * 0.5, v_in=4.0) for i in range(60) if i % 2 == 0]
+    store.ingest("KE5GDB", every_other)
+
+    assert rate_of(store) == pytest.approx(1.0, rel=0.01)
+
+
+def test_a_single_packet_has_no_rate(store):
+    store.ingest("KE5GDB", [sensor(1, 0, v_in=4.0)])
+    assert rate_of(store) == 0.0
+
+
+def test_packets_sharing_a_timestamp_do_not_divide_by_zero(store):
+    """Legal: uniqueness is (source, time, count), and a truncated packet loses
+    its count while a coarse payload clock repeats a second."""
+    store.ingest("KE5GDB", [sensor(i, 0.0, v_in=4.0) for i in range(5)])
+    assert rate_of(store) == 0.0
+
+
+def test_rate_is_measured_on_the_payload_clock(store):
+    """A payload with no PCF8523 restarts its RTC at 2021-01-01 on every power
+    cycle. Measuring against the server's clock would read zero forever on a
+    source that is transmitting perfectly well."""
+    stale = datetime(2021, 1, 1, tzinfo=timezone.utc)
+    store.ingest("KE5GDB", [
+        {"kind": "sensor", "data": {
+            "time": iso(stale + timedelta(seconds=i * 0.5)),
+            "id": "RAB_HAT_ENV", "count": i, "v_in": 4.0,
+        }} for i in range(30)
+    ])
+    assert rate_of(store) == pytest.approx(2.0, rel=0.01)
+
+
 def test_latest_reports_current_state(store):
     populate(store, 100)
     out = store.latest(1)

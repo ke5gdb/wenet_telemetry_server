@@ -118,6 +118,17 @@ Things that fail *silently*. Each cost real time or nearly did.
   different clocks is what produced a source reading `STALLED · 0.5 Hz` while
   every value on the row kept updating. `rate_hz` is *correctly* on the payload
   clock — a rate is a difference measured on one clock, so it is unaffected.
+- **The rate is over the last `RATE_SAMPLES` packets, not a fixed window.**
+  Sources here run 0.05–2 Hz and no single window serves both: the old 60 s
+  count quantised a slow source to multiples of 1/60. It follows that a source
+  that has stopped keeps reporting the rate it had — "still transmitting?" is a
+  separate question, answered by `heard_epoch`, and the display drops the figure
+  entirely once a source reads STALLED rather than printing both at once.
+- **Live figures come from re-fetching `/latest`, not from the event stream.**
+  One SSE event carries the *newest* packet per source, not the thirty that were
+  in the batch, so counting events undercounts packets and says nothing about
+  rate. The 5 s refresh re-asks the server; before it did, the rate and the
+  packet count on screen were whatever they had been at page load.
 - **GPS receptions live in their own table.** Anything counting per-callsign
   activity must union `receptions` and `gps_receptions`. Joining only the former
   dropped a GPS-only station out of the reporters panel completely.

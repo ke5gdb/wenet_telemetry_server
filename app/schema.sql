@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS packets (
   UNIQUE(source_id, payload_time, count)
 );
 CREATE INDEX IF NOT EXISTS idx_packets_source_time ON packets(source_id, payload_time);
+-- The live tiles want each source's newest few packets, which is an ordering by
+-- epoch. The index above is on the ISO text and the planner cannot use it for
+-- that, so it sorted the source's whole history in a temp B-tree instead --
+-- 24 ms per source on a 31k-packet flight, and growing with the flight. This
+-- turns it into a lookup.
+CREATE INDEX IF NOT EXISTS idx_packets_source_epoch ON packets(source_id, time_epoch);
 -- Partial index: in steady state only a handful of packets await GPS, so the
 -- backfill's "what is still pending" query stays cheap however long the flight.
 CREATE INDEX IF NOT EXISTS idx_packets_pending_alt

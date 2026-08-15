@@ -113,8 +113,17 @@ function renderSources() {
       node.className = "source" + (stalled ? " stalled" : "") +
                        (srcFolded ? " collapsed" : "");
 
+      // The rate is measured over the source's last packets, so a source that
+      // stopped keeps reporting the rate it had when it did. "STALLED 2.0 Hz"
+      // says two contradictory things at once, so the figure goes when the
+      // source does -- the tooltip keeps it, since "it was healthy at 2 Hz and
+      // then stopped" is worth knowing.
       const rate = info ? `${info.rate_hz.toFixed(1)} Hz` : "—";
       const count = info ? info.packet_count.toLocaleString() : "0";
+      const meta = stalled
+        ? `<span class="source-flag">STALLED</span> ${count}`
+        : `${rate} · ${count}`;
+      const metaTitle = stalled && info ? `last rate ${rate}` : "";
 
       const head = document.createElement("button");
       head.type = "button";
@@ -125,8 +134,7 @@ function renderSources() {
         <span class="source-dot" style="background:${colorFor(src.source_key)}"></span>
         <span class="source-name" title="${escapeHtml(src.source_key)}">${escapeHtml(
           sourceLabel(src))}</span>
-        <span class="source-meta">${
-          stalled ? '<span class="source-flag">STALLED</span> ' : ""}${rate} · ${count}</span>`;
+        <span class="source-meta" title="${escapeHtml(metaTitle)}">${meta}</span>`;
       head.addEventListener("click", () => toggleFold(srcKey));
       node.appendChild(head);
 
@@ -1134,17 +1142,35 @@ window.addEventListener("resize", () => {
   for (const { chart } of state.charts.values()) chart.draw();
 });
 
-/* Charts and the reporter tally both refresh here. The tally was previously
-   drawn only by loadFlightData(), which runs at boot and then only when a new
-   source or field appears -- so on a steady flight the bars held their
-   page-load values indefinitely. One GROUP BY every 5 s while live. */
+/* Charts, the reporter tally and the per-source figures all refresh here. Each
+   of them was previously drawn only by loadFlightData(), which runs at boot and
+   then only when a new source or field appears -- so on a steady flight the
+   bars, the rates and the packet counts held their page-load values
+   indefinitely. An hour into a flight the header read the rate from the moment
+   the tab was opened.
+
+   The live stream cannot supply these on its own: one event carries the newest
+   packet per source, not the thirty that were in the batch, so counting events
+   undercounts packets and says nothing about the rate. Re-asking the server is
+   what makes them true, and it is cheap -- the rate is measured over the last
+   RATE_SAMPLES packets, which is an index lookup. */
 setInterval(async () => {
   if (!state.live || !state.dirty) return;
   state.dirty = false;
   loadSeries();
   try {
-    state.reporters = await api(`/api/v1/flights/${state.flightId}/reporters`);
-    renderReporters(state.reporters);
+    const [latest, reporters] = await Promise.all([
+      api(`/api/v1/flights/${state.flightId}/latest`),
+      api(`/api/v1/flights/${state.flightId}/reporters`),
+    ]);
+    // Wholesale replacement, deliberately: the stream's incremental updates are
+    // an approximation between refreshes, and this is the correction.
+    state.latest = latest;
+    if (latest?.server_now) state.clockOffset = Date.now() / 1000 - latest.server_now;
+    state.reporters = reporters;
+    renderSources();
+    renderReporters(reporters);
+    renderTiles();
   } catch {
     // The link indicator already reports trouble; don't double-report it.
   }
