@@ -392,9 +392,10 @@ def test_two_transmitters_are_two_flights(store):
     flights = rows(store, "SELECT name, payload_callsign FROM flights ORDER BY id")
     assert len(flights) == 2
     assert sorted(f["payload_callsign"] for f in flights) == ["KE5GDB", "W5XYZ"]
-    # Named for the transmitter, not "#2" -- they are not repeat flights.
-    assert flights[0]["name"].startswith("KE5GDB ")
-    assert flights[1]["name"].startswith("W5XYZ ")
+    # Each is its own #1: the count is per transmitter per day, so a second
+    # transmitter is not arbitrarily the second flight of the first one's day.
+    assert flights[0]["name"].endswith(" - KE5GDB #1")
+    assert flights[1]["name"].endswith(" - W5XYZ #1")
 
     assert scalar(
         store, "SELECT COUNT(DISTINCT flight_id) FROM sources"

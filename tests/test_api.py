@@ -131,7 +131,10 @@ def test_legacy_list_body_carries_the_callsign(client):
     ])
 
     flight = client.get("/api/v1/flights").json()[0]
-    assert flight["name"].startswith("KE5GDB ")
+    assert flight["name"].endswith(" - KE5GDB #1")
+    # And as its own field, which is what the display reads: a flight renamed
+    # by hand must not lose the transmitter it belongs to.
+    assert flight["payload_callsign"] == "KE5GDB"
     sources = client.get(f"/api/v1/flights/{flight['id']}/sources").json()
     names = {f["name"] for f in sources[0]["fields"]}
     assert "payload_callsign" not in names

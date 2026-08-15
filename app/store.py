@@ -829,16 +829,18 @@ class Store:
         self, conn: sqlite3.Connection, now: str, callsign: str | None = None
     ) -> int:
         day = now[:10]
-        # The callsign leads the name because it is the identity; the date only
-        # distinguishes one flight of that transmitter from the next. Counting
-        # by name rather than by date, so two transmitters flying the same day
-        # are "KE5GDB 2026-08-15" and "W5XYZ 2026-08-15" -- not "#2".
-        base = f"{callsign} {day}" if callsign else f"Flight {day}"
+        # "Flight 2026-08-15 - KE5GDB #1". Counted per transmitter per day
+        # rather than per day, so two transmitters flying the same afternoon are
+        # each their own #1 instead of one of them being arbitrarily "#2".
+        # Numbered from the first, because "#1" reads as a flight of several and
+        # a bare name reads as the only one -- and on a launch day it is rarely
+        # the only one.
+        base = f"Flight {day} - {callsign}" if callsign else f"Flight {day}"
         same = conn.execute(
             "SELECT COUNT(*) FROM flights WHERE name = ? OR name LIKE ?",
             (base, base + " #%"),
         ).fetchone()[0]
-        name = base if not same else f"{base} #{same + 1}"
+        name = f"{base} #{same + 1}"
         cur = conn.execute(
             "INSERT INTO flights(name, started_at, last_activity, payload_callsign) "
             "VALUES (?,?,?,?)",

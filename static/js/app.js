@@ -592,11 +592,23 @@ async function loadSeries() {
 
 /* ------------------------------------------------------------------- data */
 
+/* The transmitter is shown from the flight's own field, not read out of its
+   name. The name is a label a human owns -- rename a flight "RAB-9" the moment
+   it lands, which is the normal thing to do, and a callsign baked into that
+   string is gone. Appended only when the name does not already carry it, so a
+   default name does not read "... - KE5GDB · KE5GDB". */
+function flightLabel(flight) {
+  const call = flight.payload_callsign;
+  if (!call || flight.name.includes(call)) return flight.name;
+  return `${flight.name} · ${call}`;
+}
+
 async function loadFlights() {
   state.flights = await api("/api/v1/flights");
   const select = el("flight-select");
   select.innerHTML = state.flights.map((f) =>
-    `<option value="${f.id}">${escapeHtml(f.name)} — ${f.packet_count.toLocaleString()} pkt${
+    `<option value="${f.id}">${escapeHtml(flightLabel(f))} — ${
+      f.packet_count.toLocaleString()} pkt${
       f.ended_at ? "" : " · open"}</option>`).join("")
     || `<option>No flights yet</option>`;
 
