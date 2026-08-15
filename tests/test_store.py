@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.decode import decode_packet  # noqa: E402
-from app.store import Store, derive_names  # noqa: E402
+from app.store import Store, derive_names, source_identity  # noqa: E402
 from app.timeutil import iso  # noqa: E402
 
 T0 = datetime(2026, 7, 26, 18, 0, 0, tzinfo=timezone.utc)
@@ -158,7 +158,11 @@ def test_rab8_style_records_ingest(store):
     source = rows(store, "SELECT * FROM sources")[0]
     # `id` was "generic"; the human name lives in a separate field and wins.
     assert source["payload_name"] == "XBnd RPT"
-    assert source["source_key"] == "generic"
+    # And the stored key is qualified with it. "generic" is not an identity --
+    # a second BLE payload sending the same id would otherwise land on this
+    # very row. See test_two_generic_payloads_stay_apart.
+    assert source["source_key"] == "XBnd RPT_generic"
+    assert source["task_name"] == "generic"
 
 
 @pytest.mark.parametrize(
@@ -167,11 +171,198 @@ def test_rab8_style_records_ingest(store):
         ("RAB_HAT_ENV", {}, ("RAB_HAT", "ENV")),
         ("ADC_Neck_LSM6DSOX", {}, ("ADC_Neck", "LSM6DSOX")),
         ("generic", {"payload": "XBnd RPT"}, ("XBnd RPT", "generic")),
+        # Already qualified by source_identity: the payload name is not
+        # repeated back in the task, which is displayed under it.
+        ("XBnd RPT_generic", {"payload": "XBnd RPT"}, ("XBnd RPT", "generic")),
         ("solo", {}, ("solo", "")),
     ],
 )
 def test_derive_names(source_key, data, expected):
     assert derive_names(source_key, data) == expected
+
+
+@pytest.mark.parametrize(
+    "raw_id, data, expected",
+    [
+        # Self-qualifying already: must come back byte-identical, or every key
+        # in every existing database moves.
+        ("RAB_HAT_ENV", {}, "RAB_HAT_ENV"),
+        ("RAB_HAT_ENV", {"payload": "RAB_HAT"}, "RAB_HAT_ENV"),
+        ("XBnd RPT", {"payload": "XBnd RPT"}, "XBnd RPT"),
+        # The legacy shape, which cannot stand alone.
+        ("generic", {"payload": "XBnd RPT"}, "XBnd RPT_generic"),
+        # Nothing to qualify with.
+        ("generic", {}, "generic"),
+        ("generic", {"payload": "   "}, "generic"),
+    ],
+)
+def test_source_identity(raw_id, data, expected):
+    assert source_identity(raw_id, data) == expected
+
+
+def test_two_generic_payloads_stay_apart(store):
+    """Two BLE payloads on one transmitter, both calling themselves `generic`.
+
+    Counting from their own boot, they collide on (payload_time, count)
+    constantly -- so without qualification the second one's packets are
+    silently swallowed by the dedup as duplicates of the first's.
+    """
+    def legacy(payload, count, **fields):
+        return {"kind": "sensor", "payload_callsign": "KE5GDB", "data": {
+            "time": iso(T0), "id": "generic", "payload": payload,
+            "count": count, **fields,
+        }}
+
+    first = store.ingest("KE5GDB", [legacy("XBnd RPT", 4, temp=13.6)])
+    second = store.ingest("KE5GDB", [legacy("Neck RPT", 4, temp=21.1)])
+
+    assert first.accepted == 1
+    assert second.accepted == 1 and second.duplicates == 0
+
+    keys = sorted(r[0] for r in rows(store, "SELECT source_key FROM sources"))
+    assert keys == ["Neck RPT_generic", "XBnd RPT_generic"]
+    assert scalar(store, "SELECT COUNT(*) FROM packets") == 2
+    # Both are on the same transmitter, so they belong to the same flight.
+    assert scalar(store, "SELECT COUNT(*) FROM flights") == 1
+
+
+# -- flights are one transmitter's up-burst-down --------------------------
+
+
+def gps_point(offset_s=0.0, callsign=None, alt=1000.0):
+    item = {"kind": "gps", "data": {
+        "timestamp": iso(T0 + timedelta(seconds=offset_s)),
+        "latitude": 30.1, "longitude": -97.7, "altitude": alt,
+    }}
+    if callsign is not None:
+        item["payload_callsign"] = callsign
+    return item
+
+
+def with_callsign(item, callsign):
+    return {**item, "payload_callsign": callsign}
+
+
+def test_two_transmitters_are_two_flights(store):
+    """Overlapping in time is not sharing a flight."""
+    store.ingest("KE5GDB", [
+        with_callsign(packet(source="GDB_ENV_ENV", count=1, v_in=4.0), "KE5GDB"),
+        with_callsign(packet(source="RAB_22_ENV", count=1, v_in=3.9), "W5XYZ"),
+    ])
+
+    flights = rows(store, "SELECT name, payload_callsign FROM flights ORDER BY id")
+    assert len(flights) == 2
+    assert sorted(f["payload_callsign"] for f in flights) == ["KE5GDB", "W5XYZ"]
+    # Named for the transmitter, not "#2" -- they are not repeat flights.
+    assert flights[0]["name"].startswith("KE5GDB ")
+    assert flights[1]["name"].startswith("W5XYZ ")
+
+    assert scalar(
+        store, "SELECT COUNT(DISTINCT flight_id) FROM sources"
+    ) == 2
+
+
+def test_two_transmitters_sharing_a_gps_second_both_survive(store):
+    """The collision the old (flight_id, timestamp) key would have eaten."""
+    result = store.ingest("KE5GDB", [
+        gps_point(callsign="KE5GDB", alt=1000.0),
+        gps_point(callsign="W5XYZ", alt=2000.0),
+    ])
+
+    assert result.gps_accepted == 2
+    assert result.gps_duplicates == 0
+    alts = sorted(r[0] for r in rows(store, "SELECT altitude FROM gps"))
+    assert alts == [1000.0, 2000.0]
+
+
+def test_untagged_traffic_is_its_own_flight(store):
+    """Absence is an identity, not a wildcard.
+
+    A receiver on older firmware never names the transmitter, so its packets
+    cannot be assumed to belong to the one that was named.
+    """
+    store.ingest("KE5GDB", [with_callsign(packet(count=1, v_in=4.0), "KE5GDB")])
+    store.ingest("K5NBC", [packet(source="OTHER_ENV", count=1, v_in=4.0)])
+
+    flights = rows(store, "SELECT payload_callsign FROM flights ORDER BY id")
+    assert [f["payload_callsign"] for f in flights] == ["KE5GDB", None]
+
+
+def test_same_transmitter_within_the_gap_is_one_flight(store):
+    store.ingest("KE5GDB", [with_callsign(packet(count=1, v_in=4.0), "KE5GDB")])
+    store.ingest("KE5GDB", [
+        with_callsign(packet(count=2, offset_s=600, v_in=4.1), "KE5GDB")
+    ])
+
+    assert scalar(store, "SELECT COUNT(*) FROM flights") == 1
+
+
+def test_silence_past_the_gap_starts_a_new_flight_for_that_transmitter(store):
+    store.ingest("KE5GDB", [with_callsign(packet(count=1, v_in=4.0), "KE5GDB")],
+                 received_default=iso(T0))
+    store.ingest("KE5GDB", [with_callsign(packet(count=2, v_in=4.1), "KE5GDB")],
+                 received_default=iso(T0 + timedelta(minutes=45)))
+
+    flights = rows(store, "SELECT name, ended_at FROM flights ORDER BY id")
+    assert len(flights) == 2
+    assert flights[0]["ended_at"] is not None      # closed at its last activity
+    assert flights[1]["name"].endswith("#2")       # same transmitter, same day
+
+
+def test_a_quiet_transmitter_does_not_stay_open_forever(store):
+    """The sweeper.
+
+    With one flight per transmitter, a flight is otherwise only ever closed by
+    traffic from its own transmitter -- so one that lands or is switched off
+    would read as live indefinitely.
+    """
+    store.ingest("KE5GDB", [with_callsign(packet(count=1, v_in=4.0), "KE5GDB")],
+                 received_default=iso(T0))
+    # A different transmitter, long after the first went quiet.
+    store.ingest("K5NBC", [
+        with_callsign(packet(source="OTHER_ENV", count=1, v_in=4.0), "W5XYZ")
+    ], received_default=iso(T0 + timedelta(minutes=45)))
+
+    closed = rows(store,
+                  "SELECT payload_callsign, ended_at FROM flights ORDER BY id")
+    assert closed[0]["payload_callsign"] == "KE5GDB"
+    assert closed[0]["ended_at"] is not None
+    assert closed[1]["ended_at"] is None
+
+
+def test_callsign_is_stored_on_the_rows_too(store):
+    store.ingest("KE5GDB", [
+        with_callsign(packet(count=1, v_in=4.0), "KE5GDB"),
+        gps_point(callsign="KE5GDB"),
+    ])
+
+    assert scalar(store, "SELECT payload_callsign FROM packets") == "KE5GDB"
+    assert scalar(store, "SELECT payload_callsign FROM gps") == "KE5GDB"
+
+
+def test_merge_refuses_two_different_transmitters(store):
+    store.ingest("KE5GDB", [with_callsign(packet(count=1, v_in=4.0), "KE5GDB")])
+    store.ingest("KE5GDB", [
+        with_callsign(packet(source="OTHER_ENV", count=1, v_in=4.0), "W5XYZ")
+    ])
+    a, b = [r[0] for r in rows(store, "SELECT id FROM flights ORDER BY id")]
+
+    with pytest.raises(ValueError, match="different transmitters"):
+        store.merge_flights(a, b)
+
+
+def test_merge_adopts_a_callsign_from_an_untagged_flight(store):
+    """The cutover: the same balloon before and after receivers named it."""
+    store.ingest("KE5GDB", [packet(count=1, v_in=4.0)],
+                 received_default=iso(T0))
+    store.ingest("KE5GDB", [with_callsign(packet(count=2, v_in=4.1), "KE5GDB")],
+                 received_default=iso(T0 + timedelta(minutes=45)))
+    untagged, tagged = [r[0] for r in rows(store, "SELECT id FROM flights ORDER BY id")]
+
+    store.merge_flights(untagged, tagged)
+
+    assert scalar(store, "SELECT COUNT(*) FROM flights") == 1
+    assert scalar(store, "SELECT payload_callsign FROM flights") == "KE5GDB"
 
 
 # -- truncation and raw bytes ---------------------------------------------

@@ -29,6 +29,33 @@ naively, a flight received by three stations plots every series three times.
 A packet is stored once; who heard it is recorded separately, where it becomes
 coverage data instead of noise.
 
+## Four identities, and none of them substitute
+
+Everything downstream depends on keeping these apart:
+
+| | scope | means |
+|---|---|---|
+| `reporter_id` | batch | the ground station that **heard** it |
+| `payload_callsign` | item | the Wenet transmitter that **sent** it |
+| `payload` name | source | a BLE sensor payload talking to that transmitter |
+| `data["id"]` | source | a sensor board on that BLE payload |
+
+Many ground stations report one transmitter; one ground station hears many
+transmitters; one transmitter carries several BLE payloads; each BLE payload
+carries several sensors. Folding the transmitter into the reporter would make
+"who heard it" and "who sent it" unrecoverable.
+
+**A flight is one transmitter's up-burst-down**, so flight identity is
+`(payload_callsign, silence gap)` rather than time alone — see below. The BLE
+payloads and their sensors are sources *within* a flight, which is what the
+source list groups by.
+
+`payload_callsign` is absent when the receiver's firmware predates it, or when a
+spool file written before it drains hours later. Absent is stored as NULL and is
+its own identity, not a wildcard: untagged traffic groups together rather than
+being assumed to belong to a transmitter that was named. `merge` folds the two
+together when they were in fact the same balloon.
+
 ## Altitude
 
 A pressure reading is a number; a pressure reading with an altitude is a
@@ -95,7 +122,7 @@ All via environment variables.
 | Variable | Default | Notes |
 |---|---|---|
 | `WENET_DB_PATH` | `telemetry.db` | One file. Backing up a flight is a copy. |
-| `WENET_FLIGHT_GAP_MINUTES` | `30` | Silence longer than this starts a new flight. |
+| `WENET_FLIGHT_GAP_MINUTES` | `30` | Silence longer than this starts a new flight, per transmitter. |
 | `WENET_ALTITUDE_WINDOW_SECONDS` | `10` | How far a packet may reach for a GPS fix. |
 | `WENET_INGEST_API_KEY` | *(unset)* | Unset means **ingest is open** — see below. |
 | `WENET_RATE_LIMIT_PER_MINUTE` | `6000` | Per IP. `0` disables — do that for bulk replay. |
@@ -197,6 +224,31 @@ Splitting wrongly is easy and, without merge, impossible to undo. Where both
 flights hold the same source, the sources are folded together — fields remapped,
 readings repointed, and any packet both sides already hold dropped rather than
 duplicated.
+
+Merge refuses two flights carrying **different** callsigns: that is not a split
+flight, it is two balloons, and gluing them together would put two GPS tracks in
+one flight and interpolate one balloon's altitude onto the other's sensors. An
+untagged flight merges freely into a tagged one and adopts its callsign, which
+is the cutover case — the same balloon before and after the receivers started
+naming it.
+
+### Flights
+
+A flight is one Wenet transmitter's up-burst-down. `_current_flight` matches an
+open flight on `(payload_callsign, gap)`, so two balloons in the air at once —
+or a neighbour's beacon your receiver happens to hear — are separate flights
+however much their times overlap. Nothing about the calendar is involved: a
+flight that crosses midnight stays one flight, and only its default name takes
+the start date.
+
+The gap is measured on the **reception** clock, never the payload's: a board
+with no PCF8523 restarts its RTC at 2021-01-01 on every power cycle, and judging
+silence against that would file a healthy flight under the wrong one.
+
+Because several transmitters can be up at once, every batch also sweeps closed
+any flight that has gone quiet past the gap. Without that, a flight is only ever
+closed by traffic from its own transmitter, so one that lands or is switched off
+would sit `open` forever — which the display reads as live.
 
 ### /events
 

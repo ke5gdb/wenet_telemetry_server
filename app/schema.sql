@@ -24,7 +24,15 @@ CREATE TABLE IF NOT EXISTS flights (
   started_at    TEXT NOT NULL,
   last_activity TEXT NOT NULL,
   ended_at      TEXT,
-  notes         TEXT NOT NULL DEFAULT ''
+  notes         TEXT NOT NULL DEFAULT '',
+  -- The Wenet transmitter this flight belongs to. A flight is one transmitter's
+  -- up-burst-down, so identity is (callsign, silence gap) rather than time
+  -- alone: two balloons in the air at once, or a neighbour's beacon the
+  -- receiver happens to hear, are separate flights however much they overlap.
+  -- NULL is its own identity, not a wildcard -- it means the receiver never
+  -- named the transmitter (older firmware, or a spool file written before the
+  -- field existed), which cannot be assumed to be any callsign in particular.
+  payload_callsign TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_flights_open ON flights(ended_at, last_activity);
 
@@ -55,6 +63,10 @@ CREATE TABLE IF NOT EXISTS packets (
   raw_cbor     BLOB,                       -- exactly what came off the air
   truncated    INTEGER NOT NULL DEFAULT 0,
   first_heard  TEXT NOT NULL,              -- earliest reception, server clock
+  -- What the receiver said about this packet's transmitter. Redundant with the
+  -- flight's callsign by construction, and kept anyway: it is the raw fact,
+  -- and it survives a merge or a split that rewrites which flight owns the row.
+  payload_callsign TEXT,
   -- Altitude interpolated from the GPS track. Resolved by a backfill pass
   -- rather than at ingest, because GPS and sensor packets travel separate
   -- paths and GPS routinely arrives later than the samples it belongs with.
@@ -130,6 +142,10 @@ CREATE TABLE IF NOT EXISTS gps (
   gps_fix      INTEGER,
   extra        TEXT NOT NULL DEFAULT '{}', -- batt_v, cpu_temp, ... as JSON
   first_heard  TEXT NOT NULL,
+  payload_callsign TEXT,
+  -- Safe because one transmitter emits one GPS stream and a flight is one
+  -- transmitter: two transmitters sharing a second land in different flights,
+  -- so this no longer discards the second one's fix.
   UNIQUE(flight_id, timestamp)
 );
 CREATE INDEX IF NOT EXISTS idx_gps_flight_ts ON gps(flight_id, timestamp);

@@ -275,3 +275,20 @@ stores everything as UTC and assumes naive timestamps are UTC.
 **A flight got split in two by a signal gap.** Expected, and repairable:
 `POST /api/v1/flights/{keep}/merge?from={other}`. Raise
 `WENET_FLIGHT_GAP_MINUTES` if it keeps happening.
+
+**Flights appear for transmitters that are not yours.** Also expected: a flight
+is one Wenet transmitter, so a neighbour's beacon your receiver hears becomes
+its own flight rather than contaminating yours. Nothing is filtered at ingest —
+the store stays append-only — so prune afterwards with
+`POST /api/v1/flights/{id}/close` and, if you want it gone,
+`python tools/delete_payload.py "<payload name>" --apply`.
+
+**A new flight opened the moment the upgraded receivers came online.** Correct.
+Flights before this deploy have no callsign, and an untagged flight is its own
+identity rather than a wildcard — so the first named packet cannot join it. If
+it was the same balloon, merge them: the untagged flight adopts the callsign.
+
+**A flight stays "open" long after it landed.** Should no longer happen — every
+batch sweeps closed any flight quiet for longer than the gap, whichever
+transmitter it belongs to. If one is stuck, `POST /api/v1/flights/{id}/close`
+ends it at its last activity.

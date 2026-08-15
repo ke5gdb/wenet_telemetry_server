@@ -41,6 +41,14 @@ _ADDED_COLUMNS = [
     ("packets", "altitude_resolved", "INTEGER NOT NULL DEFAULT 0"),
     ("gps", "time_epoch", "REAL NOT NULL DEFAULT 0"),
     ("readings", "ts_epoch", "REAL NOT NULL DEFAULT 0"),
+    # Nullable on purpose, and never backfilled: every row that predates the
+    # receivers naming the transmitter genuinely has no callsign, and a spool
+    # file drained hours after this deploy will still arrive without one. A
+    # NOT NULL column here would reject exactly the backlog the spool exists
+    # to protect.
+    ("flights", "payload_callsign", "TEXT"),
+    ("packets", "payload_callsign", "TEXT"),
+    ("gps", "payload_callsign", "TEXT"),
 ]
 
 #: Unix epoch as a Julian day number, for converting stored ISO text in SQL.

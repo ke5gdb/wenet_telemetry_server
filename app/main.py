@@ -132,13 +132,27 @@ async def ingest(request: Request):
     if result.new_sources:
         log.info("new sources: %s", ", ".join(result.new_sources))
 
-    if result.latest or result.gps_points:
+    # One event per flight. A batch is a time window, so it can carry two
+    # transmitters at once -- and a browser watching one of them must not be
+    # handed the other's track. `/events?flight=N` filters on `flight_id`, so a
+    # single mixed event would have to claim one flight and smuggle in the rest.
+    by_flight: dict[int, dict] = {}
+    for source_key, packet in result.latest.items():
+        entry = by_flight.setdefault(packet["flight_id"], {"sources": {}, "gps": []})
+        # Stripped on the way out: the tag exists to route the event, and the
+        # browser already knows which flight it asked for.
+        entry["sources"][source_key] = {k: v for k, v in packet.items() if k != "flight_id"}
+    for point in result.gps_points:
+        entry = by_flight.setdefault(point["flight_id"], {"sources": {}, "gps": []})
+        entry["gps"].append({k: v for k, v in point.items() if k != "flight_id"})
+
+    for flight_id, entry in by_flight.items():
         hub.publish({
             "type": "update",
-            "flight_id": result.flight_id,
+            "flight_id": flight_id,
             "reporter_id": batch.reporter_id,
-            "sources": result.latest,
-            "gps": result.gps_points,
+            "sources": entry["sources"],
+            "gps": entry["gps"],
             "new_sources": result.new_sources,
             "new_fields": result.new_fields,
         })
@@ -154,8 +168,12 @@ def _batch_from_legacy(body: list) -> IngestBatch:
             continue
         data = dict(entry)
         reporter = data.pop("reporter_id", None) or reporter
+        # Lifted out of `data` rather than left in it: it is provenance from the
+        # receiver, not something the payload transmitted, and leaving it inline
+        # would discover it as a text field on every source.
+        callsign = data.pop("payload_callsign", None)
         kind = "gps" if ("latitude" in data or "longitude" in data) else "sensor"
-        packets.append(IngestPacket(kind=kind, data=data))
+        packets.append(IngestPacket(kind=kind, data=data, payload_callsign=callsign))
     return IngestBatch(reporter_id=reporter, packets=packets)
 
 

@@ -78,6 +78,99 @@ def test_legacy_body_routes_gps_by_shape(client):
     assert client.get("/api/v1/health").json()["stats"]["gps"] == 1
 
 
+def test_payload_callsign_is_accepted_and_keys_the_flight(client):
+    """The wire shape the receivers now send."""
+    resp = client.post("/api/v1/ingest", json={"reporter_id": "KE5GDB", "packets": [
+        {"kind": "sensor", "data": SENSOR, "payload_callsign": "KE5GDB"},
+        {"kind": "sensor", "data": {**SENSOR, "id": "OTHER_ENV"},
+         "payload_callsign": "W5XYZ"},
+    ]})
+
+    assert resp.status_code == 200
+    assert resp.json()["accepted"] == 2
+    # One POST, two transmitters, two flights -- batching is by time, so a batch
+    # spanning two payloads is normal rather than an error.
+    flights = client.get("/api/v1/flights").json()
+    assert len(flights) == 2
+    assert {f["packet_count"] for f in flights} == {1}
+
+
+def test_batch_without_callsign_still_ingests(client):
+    """Old receiver firmware, and spool files written before the field existed.
+
+    These drain hours later and must not be rejected: a 4xx here would grow a
+    spool on every ground station rather than lose data visibly.
+    """
+    resp = client.post("/api/v1/ingest", json={
+        "reporter_id": "KE5GDB",
+        "packets": [{"kind": "sensor", "data": SENSOR}],
+    })
+
+    assert resp.status_code == 200
+    assert resp.json()["accepted"] == 1
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_blank_callsign_is_treated_as_absent(client, blank):
+    """A blank must not become a callsign that a flight is keyed on."""
+    client.post("/api/v1/ingest", json={"reporter_id": "KE5GDB", "packets": [
+        {"kind": "sensor", "data": SENSOR, "payload_callsign": blank},
+    ]})
+    client.post("/api/v1/ingest", json={"reporter_id": "KE5GDB", "packets": [
+        {"kind": "sensor", "data": {**SENSOR, "count": 13}},
+    ]})
+
+    # Both land in the one untagged flight rather than splitting in two.
+    assert len(client.get("/api/v1/flights").json()) == 1
+
+
+def test_legacy_list_body_carries_the_callsign(client):
+    """The flat-list shape gets it too, and it does not become a sensor field."""
+    client.post("/api/v1/ingest", json=[
+        {**SENSOR, "reporter_id": "KE5GDB", "payload_callsign": "KE5GDB"},
+    ])
+
+    flight = client.get("/api/v1/flights").json()[0]
+    assert flight["name"].startswith("KE5GDB ")
+    sources = client.get(f"/api/v1/flights/{flight['id']}/sources").json()
+    names = {f["name"] for f in sources[0]["fields"]}
+    assert "payload_callsign" not in names
+
+
+def test_live_push_is_split_per_flight(client, monkeypatch):
+    """A mixed batch must not hand one transmitter's track to the other's tab.
+
+    `/events?flight=N` filters on the event's flight_id, so a single event for
+    a two-transmitter batch would have to claim one flight and smuggle in the
+    other's GPS -- which the display appends straight onto the map.
+    """
+    published = []
+    monkeypatch.setattr(main.hub, "publish", published.append)
+
+    client.post("/api/v1/ingest", json={"reporter_id": "KE5GDB", "packets": [
+        {"kind": "sensor", "data": SENSOR, "payload_callsign": "KE5GDB"},
+        {"kind": "gps", "payload_callsign": "KE5GDB",
+         "data": {"timestamp": "20260726T182204.000Z", "latitude": 32.9,
+                  "longitude": -97.2, "altitude": 18422.0}},
+        {"kind": "gps", "payload_callsign": "W5XYZ",
+         "data": {"timestamp": "20260726T182204.000Z", "latitude": 30.1,
+                  "longitude": -97.7, "altitude": 900.0}},
+    ]})
+
+    assert len(published) == 2
+    by_flight = {e["flight_id"]: e for e in published}
+    assert len(by_flight) == 2
+    for event in published:
+        assert len(event["gps"]) == 1
+        # The routing tag is stripped before it reaches a browser.
+        assert "flight_id" not in event["gps"][0]
+        for packet in event["sources"].values():
+            assert "flight_id" not in packet
+
+    mine = next(e for e in published if e["sources"])
+    assert mine["gps"][0]["alt"] == 18422.0
+
+
 def test_packet_without_raw_or_data_is_a_validation_error(client):
     resp = client.post("/api/v1/ingest", json={"packets": [{"kind": "sensor"}]})
     assert resp.status_code == 422
