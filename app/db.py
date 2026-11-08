@@ -52,6 +52,7 @@ _ADDED_COLUMNS = [
     # Every source that predates this is a sensor source, which is what the
     # default says -- so no backfill is needed here either.
     ("sources", "kind", "TEXT NOT NULL DEFAULT 'sensor'"),
+    ("flights", "hidden", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 #: Unix epoch as a Julian day number, for converting stored ISO text in SQL.
@@ -97,6 +98,33 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for table, sql in _BACKFILLS:
         if table in touched:
             conn.execute(sql, (_JULIAN_EPOCH,))
+
+    _close_duplicate_open_flights(conn)
+
+
+def _close_duplicate_open_flights(conn: sqlite3.Connection) -> None:
+    """Make an older database satisfy the one-open-flight-per-callsign index.
+
+    The schema script would otherwise fail to create the index and the server
+    would not start. The most recently active flight stays open; the others are
+    closed at their own last activity, which is what the silence sweeper would
+    have done. Their data is untouched -- merge them afterwards if they were
+    the same flight.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='flights'"
+    ).fetchone():
+        return
+    conn.execute(
+        "UPDATE flights SET ended_at=last_activity WHERE ended_at IS NULL AND id NOT IN ("
+        "  SELECT id FROM ("
+        "    SELECT id, ROW_NUMBER() OVER ("
+        "      PARTITION BY COALESCE(payload_callsign, '') "
+        "      ORDER BY last_activity DESC, id DESC) AS rn "
+        "    FROM flights WHERE ended_at IS NULL"
+        "  ) WHERE rn = 1"
+        ")"
+    )
 
 
 class ConnectionPool:

@@ -60,7 +60,8 @@ sudo nano /etc/wenet-telemetry.env
 ```
 
 Read the comments in that file before moving on — particularly the one about
-ingest being open by default.
+ingest being open by default. Set `WENET_ADMIN_PASSWORD` too: without it the
+admin panel at `/admin/` and every flight-editing endpoint are switched off.
 
 ## 4. Service
 
@@ -272,23 +273,32 @@ mode creates `-wal` and `-shm` alongside.
 carrying boot-relative time; check the RTC per the payload README. The server
 stores everything as UTC and assumes naive timestamps are UTC.
 
-**A flight got split in two by a signal gap.** Expected, and repairable:
-`POST /api/v1/flights/{keep}/merge?from={other}`. Raise
-`WENET_FLIGHT_GAP_MINUTES` if it keeps happening.
+**The admin panel says "Admin is switched off", or renaming does nothing.**
+`WENET_ADMIN_PASSWORD` is unset. Every administrative endpoint is refused until
+it is set; restart after setting it.
+
+**`/admin` opens the display, filtered to "ADMIN".** nginx is missing the
+`location = /admin` redirect, so the path matched the callsign pattern. Use
+`/admin/`, or add the block from `deploy/`.
+
+**A flight got split in two by a signal gap.** Expected, and repairable: merge
+them in the admin panel (or `POST /api/v1/flights/{keep}/merge?from={other}`).
+Raise `WENET_FLIGHT_GAP_MINUTES` if it keeps happening.
 
 **Flights appear for transmitters that are not yours.** Also expected: a flight
 is one Wenet transmitter, so a neighbour's beacon your receiver hears becomes
 its own flight rather than contaminating yours. Nothing is filtered at ingest —
-the store stays append-only — so prune afterwards with
-`POST /api/v1/flights/{id}/close` and, if you want it gone,
-`python tools/delete_payload.py "<payload name>" --apply`.
+the store stays append-only — so hide it in the admin panel and, if you want it
+gone, `python tools/delete_payload.py "<payload name>" --apply`.
 
-**A new flight opened the moment the upgraded receivers came online.** Correct.
-Flights before this deploy have no callsign, and an untagged flight is its own
-identity rather than a wildcard — so the first named packet cannot join it. If
-it was the same balloon, merge them: the untagged flight adopts the callsign.
+**An untagged flight runs alongside a tagged one.** Flights recorded before
+untagged traffic was attributed came in pairs like this — the receivers that
+had not (yet) learned the callsign filed their copies separately. The admin
+panel flags each pair; merge into the tagged one. New traffic only stays
+untagged when it genuinely cannot be placed: two tagged balloons up at once and
+nothing in the packet saying which, or a fix more than 100 km from every flight.
 
 **A flight stays "open" long after it landed.** Should no longer happen — every
 batch sweeps closed any flight quiet for longer than the gap, whichever
-transmitter it belongs to. If one is stuck, `POST /api/v1/flights/{id}/close`
+transmitter it belongs to. If one is stuck, close it in the admin panel; that
 ends it at its last activity.

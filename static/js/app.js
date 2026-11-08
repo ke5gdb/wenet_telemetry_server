@@ -920,8 +920,19 @@ function wireRename() {
     }
   };
 
+  // Renaming needs an admin login, so the title only offers it to an admin.
+  // Asked once at load; a failure just leaves the title as plain text.
+  api("/api/v1/admin/session").then((session) => {
+    state.canRename = !!session.authenticated;
+    if (!state.canRename) return;
+    title.tabIndex = 0;
+    title.setAttribute("role", "button");
+    title.title = "Click to rename";
+    title.classList.add("renamable");
+  }).catch(() => {});
+
   title.addEventListener("click", () => {
-    if (state.flightId == null) return;
+    if (state.flightId == null || !state.canRename) return;
     title.contentEditable = "true";
     title.focus();
     getSelection().selectAllChildren(title);

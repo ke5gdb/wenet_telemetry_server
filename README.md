@@ -1,61 +1,22 @@
 # Wenet Telemetry Server
 
-Watch a high-altitude balloon's sensors live while it is in the air, and keep
-everything it sent in a form you can actually analyze afterwards.
+This project serves as the display and archive server for data conveyed through Wenet CBOR telemetry packets.
 
-Point your ground stations at it and open the page. The payload's sensors appear
-on their own as packets arrive -- no configuration, no schema to edit, nothing to
-change when you fly a different payload. Several ground stations can report the
-same flight without the data being counted twice, and every reading ends up with
-an altitude attached, so a pressure trace becomes a sounding.
+Data follows these steps:
 
-**Status:** deployed and running behind nginx. [HANDOFF.md](HANDOFF.md) records
-what is *proven* against real flight data versus merely built -- worth reading
-before a flight depends on it. [DEPLOY.md](DEPLOY.md) is the setup guide.
+1. It is collected by a raw sensor that is connected to a Pi Pico 2W. The Pico 2W runs [Wenet BLE Sensor](https://github.com/ke5gdb/wenet_ble_sensor).
+1. Data is received by the larger Wenet payload on your flight string using [Wenet Payload BLE Bridge](https://github.com/ke5gdb/wenet_payload_ble_bridge). This utility connects to BLE devices that identify with a special Wenet UUID. A timestamp correction is applied to incoming data, and then it is relayed via UDP packet to the standard Wenet process.
+1. The [Wenet](https://github.com/projecthorus/wenet/) process transmits the data as a CBOR-type packet (type `0x05`). 
+1. Data is received via the standard Wenet ground stations and broadcast locally on the ground station network via UDP. 
+   1. NOTE: This does not yet work with WebHorus/WebWenet. You must be running the Docker or bare metal Linux versions.
+1. The UDP telemetry packets are received by [Welent Telemetry Forwarder](https://github.com/ke5gdb/wenet_telemetry_forwarder) and relayed to a user-configured telemetry server.
+1. Data is displayed and archived by **this** project, Wenet Telemetry Server.
 
-## What you get
-
-- **A live display that builds itself.** Sources, fields, units and charts all
-  come from what arrives. For example, DS18X20 names itself from its ROM at runtime, so
-  `temp-004a` can never appear in a static schema -- nothing here needs it to.
-- **One link per transmitter.** `{server}/W1ABC` opens the display filtered to
-  that balloon. Hand it to the general public; it needs no explanation, and it works
-  before the launch, waiting and picking the flight up when the first packet
-  lands.
-- **Soundings, not just time series.** Switch the x-axis to altitude and a
-  pressure or temperature trace becomes a profile of the atmosphere. Each packet
-  gets its altitude interpolated from the GPS track.
-- **Several ground stations, one copy of the data.** The same transmission heard
-  by three receivers is stored once, and who heard it is recorded separately --
-  where it becomes useful coverage data instead of a series plotted three times.
-- **The transmitter's own health.** Wenet GPS packets carry CPU and radio
-  temperature, load, disk, camera focus, battery volts and amps. All of it charts
-  beside the sensors, so thermal throttling on the ascent is visible.
-- **Nothing is thrown away.** Raw packets are archived exactly as they came off
-  the air, so a decoder fix can be replayed over an old flight. Exports are CSV,
-  JSON Lines, raw CBOR, or the whole database.
-- **Outages are survivable.** A ground station that loses its link spools to disk
-  and drains later; GPS data that arrives hours after the samples it belongs with
-  still backfills their altitudes.
-
-## Where it sits
-
-```
-balloon                       ground                          you
-┌──────────────┐   RF   ┌──────────────┐  UDP  ┌───────────┐       ┌─────────┐
-│ BLE sensor   │───────▶│ Wenet        │──────▶│ wenet_    │──HTTP▶│ this    │
-│ payloads     │  BLE   │ transmitter  │       │ forwarder │       │ server  │
-│ (many, each  │───────▶│ (GPS + radio)│       │ (spools   │       │         │
-│  many sensors)│       └──────────────┘       │  on fail) │       └────┬────┘
-└──────────────┘                               └───────────┘            │
-                        …and any number of other ground stations ───────┤
-                                                                        ▼
-                                                              browsers, exports
-```
-
-This server is the last box. The receiver and forwarder live in
-[wenet_forwarder](../wenet_forwarder); everything upstream of the UDP frame is
-somebody else's problem, which is the point.
+Features of Wenet Telemetry Server: 
+- Live displays build themselves -- all sources, fields, units, and charts are dynamically generated from the data that arrives. No configuration is required for a BLE sensor payload's data to be displayed.
+- Deduplication of data received by multiple ground stations. A unique record is maintained for packet counts, but data itself is deduplicated. 
+- Raw packets are archived for future analysis and flight data replays. 
+- Outages are survivable -- ground stations spool data locally if their internet connection is lost. This data is then uploaded when possible. 
 
 ## Quick start
 
@@ -100,9 +61,13 @@ Back button steps back out of each zoom, and the view is in the URL throughout,
 so any of it can be pasted to someone else.
 
 A flight is one transmitter's up-burst-down, segmented automatically on a silence
-gap. Click the title to rename it -- "RAB-9" beats "Flight 2026-08-15 - KE5GDB #1"
-once it has landed. If a signal gap wrongly split one flight in two, merge them;
-if two flights ran together, split them.
+gap. There is only ever one open flight per callsign. Flight housekeeping lives in
+the **admin panel at `/admin/`** (password from `WENET_ADMIN_PASSWORD`): rename
+-- "RAB-9" beats "Flight 2026-08-15 - KE5GDB #1" once it has landed -- annotate,
+close, hide test flights from the public list, merge a flight a signal gap split
+in two, or split two that ran together. The panel flags overlapping flights that
+are probably one flight in two halves. Logged in, the display's title is also
+click-to-rename.
 
 The source list keeps showing the payload's *latest* values even while a window
 is open -- it is a status panel, alongside rate, packet count and stalled state,
@@ -133,7 +98,7 @@ memory. The database snapshot uses `VACUUM INTO` and is safe on a live server.
 
 ## Feeding it
 
-Ground stations POST batches. This is the whole contract:
+Ground stations POST batches. Example:
 
 ```json
 {
@@ -154,9 +119,13 @@ Three identities meet there and none can stand in for another:
 | `payload_callsign` | the Wenet transmitter that **sent** it -- what a flight is keyed on |
 | `data.id` | the sensor board on one of the BLE payloads talking to that transmitter |
 
-`payload_callsign` is optional: older receivers do not report one, and packets
-without it group together rather than being assumed to belong to a transmitter
-that was named. `raw` is optional but preferred -- it is what makes the archive
+`payload_callsign` is optional, and often missing: the Wenet receiver learns the
+callsign from SSDV image packets, so it sends none until its first image decodes,
+and older receivers never send one. An untagged packet joins the flight it
+evidently belongs to -- the one already holding its sensor source, else the
+nearest GPS track, else the only tagged flight in the air -- and stays apart only
+when that is genuinely ambiguous. The first tagged packet adopts an untagged
+flight already under way. `raw` is optional but preferred -- it is what makes the archive
 lossless. A bare JSON list is also accepted, which is what an unmodified
 forwarder sends.
 
@@ -177,13 +146,24 @@ GET   /api/v1/flights/{id}/series        downsampled values (?field=…&axis=…
 GET   /api/v1/flights/{id}/track         GPS polyline, thinned
 GET   /events                            live SSE stream (?flight=…)
 
-PATCH /api/v1/flights/{id}               rename, set notes
+```
+
+Administration needs the admin password, as a login cookie
+(`POST /api/v1/admin/login`, which the panel does) or an `X-Admin-Password`
+header for scripts. With `WENET_ADMIN_PASSWORD` unset these are all refused.
+
+```
+GET   /api/v1/admin/flights              every flight incl. hidden, with overlaps
+PATCH /api/v1/flights/{id}               rename, notes, hidden (hiding closes it)
 POST  /api/v1/flights/{id}/close         end it now
 POST  /api/v1/flights/{id}/merge?from=N  fold N into this flight
 POST  /api/v1/flights/{id}/split?at=…    cut in two at a timestamp
 POST  /api/v1/flights/{id}/backfill      re-resolve altitudes (?force)
 PATCH /api/v1/fields/{id}                set a field's unit or label
 ```
+
+Hidden flights leave `GET /api/v1/flights` but are still served by id -- hiding
+tidies the list, it does not protect anything.
 
 `series?field=` takes a field id, `source_key:name`, or a bare `name` -- the last
 returns that field from every source that has it, since the same sensor name
@@ -244,7 +224,7 @@ tools/
   fake_receiver.py    emit Wenet UDP frames as the receiver would
   materialize_gps.py  backfill GPS housekeeping as chartable series (old flights)
   delete_payload.py   remove a payload that was never on your balloon
-tests/         159 tests, chiefly pinning the dedup, altitude and merge rules
+tests/         200 tests, chiefly pinning the dedup, altitude and merge rules
 ```
 
 ## Where the reasoning lives

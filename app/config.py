@@ -45,5 +45,13 @@ RATE_LIMIT_PER_MINUTE = _int("WENET_RATE_LIMIT_PER_MINUTE", 6000)
 #: no altitude instead, which is honest and visibly a gap on a plot.
 ALTITUDE_WINDOW_SECONDS = _float("WENET_ALTITUDE_WINDOW_SECONDS", 10.0)
 
+#: Password for the admin panel and every write endpoint other than ingest --
+#: rename, close, merge, split, hide, field edits. Unset, those are refused
+#: outright rather than left open.
+ADMIN_PASSWORD = os.getenv("WENET_ADMIN_PASSWORD") or None
+
+#: How long an admin login lasts before the panel asks again.
+ADMIN_SESSION_HOURS = _int("WENET_ADMIN_SESSION_HOURS", 168)
+
 #: Refuse absurd batches outright rather than parsing them.
 MAX_BATCH_PACKETS = _int("WENET_MAX_BATCH_PACKETS", 2000)

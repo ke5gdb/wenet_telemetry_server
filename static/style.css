@@ -199,8 +199,8 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
 .status[data-state="stalled"] .status-dot { background: var(--critical); }
 .status[data-state="replay"]  .status-dot { background: var(--warning); }
 
-#flight-name { cursor: text; }
-#flight-name:hover { text-decoration: underline dotted var(--text-muted); }
+#flight-name.renamable { cursor: text; }
+#flight-name.renamable:hover { text-decoration: underline dotted var(--text-muted); }
 #flight-name[contenteditable="true"] {
   outline: 2px solid var(--series-1); outline-offset: 2px; border-radius: 3px;
   cursor: text;

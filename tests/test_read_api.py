@@ -28,6 +28,13 @@ def client(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def admin_client(client, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "hunter2")
+    client.headers["X-Admin-Password"] = "hunter2"
+    return client
+
+
+@pytest.fixture
 def store(tmp_path):
     s = Store(tmp_path / "read.db", altitude_window=10.0)
     yield s
@@ -360,7 +367,8 @@ def test_latest_with_no_gps_yet(store):
 # -- field metadata -------------------------------------------------------
 
 
-def test_field_metadata_can_be_set(client):
+def test_field_metadata_can_be_set(admin_client):
+    client = admin_client
     client.post("/api/v1/ingest", json={"reporter_id": "KE5GDB", "packets": [
         sensor(1, 0, mystery_sensor=42.0)]})
     sources = client.get("/api/v1/flights/1/sources").json()
@@ -375,8 +383,8 @@ def test_field_metadata_can_be_set(client):
     assert resp.json()["user_edited"] == 1
 
 
-def test_patching_an_unknown_field_is_404(client):
-    assert client.patch("/api/v1/fields/999", json={"unit": "x"}).status_code == 404
+def test_patching_an_unknown_field_is_404(admin_client):
+    assert admin_client.patch("/api/v1/fields/999", json={"unit": "x"}).status_code == 404
 
 
 # -- HTTP surface ---------------------------------------------------------

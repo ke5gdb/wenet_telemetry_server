@@ -12,15 +12,16 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
-from . import config, export
+from . import admin, config, export
 from .hub import Hub
 from .models import IngestBatch, IngestPacket
 from .store import Store
+from .timeutil import to_epoch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +47,8 @@ async def lifespan(app: FastAPI):
         log.info("ingest requires X-API-KEY")
     else:
         log.warning("ingest is UNAUTHENTICATED (set WENET_INGEST_API_KEY to require a key)")
+    if not admin.enabled():
+        log.warning("admin is disabled (set WENET_ADMIN_PASSWORD to enable it)")
     try:
         yield
     finally:
@@ -192,6 +195,16 @@ if STATIC_DIR.is_dir():
     async def index():
         return FileResponse(STATIC_DIR / "index.html")
 
+    # A directory rather than `/admin`, because a single segment is a callsign
+    # to nginx: `/admin` would be served the display, filtered to "ADMIN".
+    @app.get("/admin", include_in_schema=False)
+    async def admin_redirect():
+        return RedirectResponse("/admin/", status_code=301)
+
+    @app.get("/admin/", include_in_schema=False)
+    async def admin_page():
+        return FileResponse(STATIC_DIR / "admin" / "index.html")
+
 
 @app.get("/api/v1/health")
 async def health():
@@ -258,7 +271,7 @@ class FieldUpdate(BaseModel):
     label: str | None = None
 
 
-@app.patch("/api/v1/fields/{field_id}")
+@app.patch("/api/v1/fields/{field_id}", dependencies=[Depends(admin.require_admin)])
 async def patch_field(field_id: int, update: FieldUpdate):
     """Name or unit a field the server had no seed metadata for."""
     row = await asyncio.to_thread(
@@ -350,25 +363,103 @@ async def export_db():
     return _download(stream, "wenet-telemetry.db", "application/x-sqlite3")
 
 
+# -- admin session ---------------------------------------------------------
+
+
+class Login(BaseModel):
+    password: str
+
+
+@app.get("/api/v1/admin/session")
+async def admin_session(request: Request):
+    """Whether admin is switched on, and whether this browser is logged in.
+
+    Open to anyone: the display asks it to decide whether to offer renaming.
+    """
+    return {"enabled": admin.enabled(), "authenticated": admin.is_admin(request)}
+
+
+@app.post("/api/v1/admin/login", dependencies=[Depends(admin.check_login_rate)])
+async def admin_login(body: Login, request: Request, response: Response):
+    if not admin.enabled():
+        raise HTTPException(403, "admin is disabled: set WENET_ADMIN_PASSWORD")
+    if not admin.password_ok(body.password):
+        raise HTTPException(401, "wrong password")
+    admin.set_cookie(response, request)
+    return {"enabled": True, "authenticated": True}
+
+
+@app.post("/api/v1/admin/logout")
+async def admin_logout(response: Response):
+    admin.clear_cookie(response)
+    return {"enabled": admin.enabled(), "authenticated": False}
+
+
+#: Flights this close in time count as touching. The untagged twin from a
+#: receiver's first seconds -- before it has decoded an image and learned the
+#: callsign -- ends moments before the tagged flight begins, without overlapping.
+_TOUCH_SECONDS = 300
+
+
+def _overlaps(flights: list[dict]) -> dict[int, list[int]]:
+    """For each flight, the others it could be half of.
+
+    Two flights overlapping (or touching) in time are one flight split in two
+    when their callsigns agree or one has none -- the untagged twins that
+    ingest used to open beside every tagged flight. Different callsigns
+    overlapping is two balloons, which is not a candidate.
+    """
+    def span(f):
+        return to_epoch(f["started_at"]), to_epoch(f["ended_at"] or f["last_activity"])
+
+    out: dict[int, list[int]] = {f["id"]: [] for f in flights}
+    for i, a in enumerate(flights):
+        a0, a1 = span(a)
+        for b in flights[i + 1:]:
+            ca, cb = a["payload_callsign"], b["payload_callsign"]
+            if ca and cb and ca != cb:
+                continue
+            b0, b1 = span(b)
+            if a0 <= b1 + _TOUCH_SECONDS and b0 <= a1 + _TOUCH_SECONDS:
+                out[a["id"]].append(b["id"])
+                out[b["id"]].append(a["id"])
+    return out
+
+
+@app.get("/api/v1/admin/flights", dependencies=[Depends(admin.require_admin)])
+async def admin_flights():
+    """Every flight, hidden ones included, with likely merge partners."""
+    rows = await asyncio.to_thread(get_store().flights, True)
+    overlaps = _overlaps(rows)
+    for row in rows:
+        row["overlaps"] = overlaps[row["id"]]
+    return rows
+
+
 # -- flight administration ------------------------------------------------
 
 
 class FlightUpdate(BaseModel):
     name: str | None = None
     notes: str | None = None
+    hidden: bool | None = None
 
 
-@app.patch("/api/v1/flights/{flight_id}")
+@app.patch("/api/v1/flights/{flight_id}", dependencies=[Depends(admin.require_admin)])
 async def patch_flight(flight_id: int, update: FlightUpdate):
+    """Rename, annotate, hide or unhide. Hiding an open flight also closes it."""
+    name = update.name.strip() if update.name is not None else None
+    if name == "":
+        raise HTTPException(400, "name cannot be blank")
     row = await asyncio.to_thread(
-        get_store().update_flight, flight_id, update.name, update.notes
+        get_store().update_flight, flight_id, name, update.notes, update.hidden
     )
     if row is None:
         raise HTTPException(404, "no such flight")
     return row
 
 
-@app.post("/api/v1/flights/{flight_id}/close")
+@app.post("/api/v1/flights/{flight_id}/close", dependencies=[Depends(admin.require_admin)])
 async def close_flight(flight_id: int):
     row = await asyncio.to_thread(get_store().close_flight, flight_id)
     if row is None:
@@ -376,7 +467,7 @@ async def close_flight(flight_id: int):
     return row
 
 
-@app.post("/api/v1/flights/{flight_id}/merge")
+@app.post("/api/v1/flights/{flight_id}/merge", dependencies=[Depends(admin.require_admin)])
 async def merge_flight(flight_id: int, from_flight: int = Query(..., alias="from")):
     """Fold `from` into this flight.
 
@@ -391,7 +482,7 @@ async def merge_flight(flight_id: int, from_flight: int = Query(..., alias="from
         raise HTTPException(400, str(exc))
 
 
-@app.post("/api/v1/flights/{flight_id}/split")
+@app.post("/api/v1/flights/{flight_id}/split", dependencies=[Depends(admin.require_admin)])
 async def split_flight(flight_id: int, at: str):
     try:
         return await asyncio.to_thread(get_store().split_flight, flight_id, at)
@@ -441,7 +532,7 @@ async def events(request: Request, flight: int | None = None):
     )
 
 
-@app.post("/api/v1/flights/{flight_id}/backfill")
+@app.post("/api/v1/flights/{flight_id}/backfill", dependencies=[Depends(admin.require_admin)])
 async def backfill(flight_id: int, force: bool = False):
     """Re-resolve altitudes.
 

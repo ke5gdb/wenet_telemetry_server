@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Wenet Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body class="admin">
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <h1>Wenet Telemetry · Admin</h1>
+  </div>
+  <div class="topbar-actions">
+    <a class="btn" href="/">Display</a>
+    <button class="btn" id="logout" type="button" hidden>Log out</button>
+  </div>
+</header>
+
+<main class="admin-main">
+
+  <section class="admin-card" id="disabled" hidden>
+    <h2>Admin is switched off</h2>
+    <p>Set <code>WENET_ADMIN_PASSWORD</code> in the server's environment and
+      restart it. Until then every administrative endpoint is refused.</p>
+  </section>
+
+  <form class="admin-card login" id="login" hidden>
+    <h2>Log in</h2>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button class="btn btn-primary" type="submit">Log in</button>
+    <p class="form-error" id="login-error" role="alert"></p>
+  </form>
+
+  <section id="panel" hidden>
+    <div class="admin-toolbar">
+      <h2>Flights</h2>
+      <label class="check"><input type="checkbox" id="show-hidden" checked> Show hidden</label>
+      <span class="toolbar-note" id="summary"></span>
+    </div>
+    <p class="form-error" id="panel-error" role="alert"></p>
+    <div id="flights" class="flight-list"></div>
+  </section>
+
+</main>
+
+<script type="module" src="/static/js/admin.js"></script>
+</body>
+</html>

@@ -232,3 +232,139 @@ def test_api_key_is_enforced_when_configured(client, monkeypatch):
     assert client.post(
         "/api/v1/ingest", json=body, headers={"X-API-KEY": "s3cret"}
     ).status_code == 200
+
+
+# -- admin ------------------------------------------------------------------
+
+from app import admin  # noqa: E402
+
+
+@pytest.fixture
+def admin_on(monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "hunter2")
+    admin._attempts.clear()
+
+
+def ingest_one(client, callsign="KE5GDB", count=12):
+    client.post("/api/v1/ingest", json={"reporter_id": "KE5GDB", "packets": [
+        {"kind": "sensor", "data": {**SENSOR, "count": count},
+         "payload_callsign": callsign}]})
+
+
+def test_admin_endpoints_are_refused_when_no_password_is_set(client, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", None)
+    ingest_one(client)
+
+    assert client.get("/api/v1/admin/session").json() == {
+        "enabled": False, "authenticated": False}
+    assert client.patch("/api/v1/flights/1", json={"name": "x"}).status_code == 403
+    assert client.post("/api/v1/admin/login", json={"password": ""}).status_code == 403
+    # The header is no way around it either: there is no password to match.
+    resp = client.post("/api/v1/flights/1/close", headers={"X-Admin-Password": ""})
+    assert resp.status_code == 403
+
+
+@pytest.mark.parametrize("method, path", [
+    ("patch", "/api/v1/flights/1"),
+    ("post", "/api/v1/flights/1/close"),
+    ("post", "/api/v1/flights/1/merge?from=2"),
+    ("post", "/api/v1/flights/1/split?at=2026-07-26T18:22:00Z"),
+    ("post", "/api/v1/flights/1/backfill"),
+    ("patch", "/api/v1/fields/1"),
+    ("get", "/api/v1/admin/flights"),
+])
+def test_every_write_endpoint_needs_a_login(client, admin_on, method, path):
+    ingest_one(client)
+    kwargs = {"json": {}} if method == "patch" else {}
+    assert getattr(client, method)(path, **kwargs).status_code == 401
+    assert getattr(client, method)(
+        path, headers={"X-Admin-Password": "wrong"}, **kwargs).status_code == 401
+
+
+def test_login_cookie_grants_admin_and_logout_revokes_it(client, admin_on):
+    ingest_one(client)
+
+    assert client.post("/api/v1/admin/login", json={"password": "nope"}).status_code == 401
+    resp = client.post("/api/v1/admin/login", json={"password": "hunter2"})
+    assert resp.status_code == 200
+    cookie = resp.headers["set-cookie"].lower()
+    assert "httponly" in cookie and "samesite=strict" in cookie
+
+    assert client.get("/api/v1/admin/session").json()["authenticated"] is True
+    assert client.patch("/api/v1/flights/1", json={"name": "RAB-9"}).json()["name"] == "RAB-9"
+
+    client.post("/api/v1/admin/logout")
+    assert client.get("/api/v1/admin/session").json()["authenticated"] is False
+    assert client.patch("/api/v1/flights/1", json={"name": "x"}).status_code == 401
+
+
+def test_session_tokens_cannot_be_forged_or_outlive_their_expiry(admin_on):
+    token = admin.issue_token()
+    assert admin.token_valid(token)
+
+    expiry, _, sig = token.partition(".")
+    assert not admin.token_valid(f"{int(expiry) + 3600}.{sig}")      # extended
+    assert not admin.token_valid(f"{expiry}.{'0' * len(sig)}")       # forged
+    assert not admin.token_valid(token, now=int(expiry) + 1)         # expired
+    assert not admin.token_valid("garbage")
+
+
+def test_changing_the_password_logs_everyone_out(admin_on, monkeypatch):
+    token = admin.issue_token()
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "correct horse")
+    assert not admin.token_valid(token)
+
+
+def test_login_attempts_are_rate_limited(client, admin_on):
+    codes = [client.post("/api/v1/admin/login", json={"password": "x"}).status_code
+             for _ in range(admin.LOGIN_ATTEMPTS_PER_MINUTE + 1)]
+    assert codes[:-1] == [401] * admin.LOGIN_ATTEMPTS_PER_MINUTE
+    assert codes[-1] == 429
+
+
+def test_hidden_flights_leave_the_public_list_but_not_the_admin_one(client, admin_on):
+    ingest_one(client)
+    auth = {"X-Admin-Password": "hunter2"}
+
+    resp = client.patch("/api/v1/flights/1", json={"hidden": True}, headers=auth)
+    assert resp.json()["hidden"] == 1
+    assert resp.json()["ended_at"] is not None     # hiding an open flight closes it
+
+    assert client.get("/api/v1/flights").json() == []
+    assert [f["id"] for f in client.get("/api/v1/admin/flights", headers=auth).json()] == [1]
+    # Still served by id: hiding tidies the list, it does not protect data.
+    assert client.get("/api/v1/flights/1/sources").status_code == 200
+
+
+def test_admin_list_points_out_twin_flights(client, admin_on):
+    """Overlapping, and the callsigns do not disagree: one flight in two halves."""
+    st = main.get_store()
+    conn = st.pool.get()
+    with conn:
+        for name, call, start, end in [
+            ("tagged", "K5RWK", "2026-10-24T13:00:00Z", "2026-10-24T16:00:00Z"),
+            ("twin", None, "2026-10-24T13:30:00Z", "2026-10-24T16:10:00Z"),
+            ("other balloon", "VK5ARG", "2026-10-24T14:00:00Z", "2026-10-24T15:00:00Z"),
+            ("later", "K5RWK", "2026-10-25T13:00:00Z", "2026-10-25T14:00:00Z"),
+            # A receiver's untagged first seconds: ends just before "tagged" starts.
+            ("startup", None, "2026-10-24T12:59:30Z", "2026-10-24T12:59:55Z"),
+        ]:
+            conn.execute(
+                "INSERT INTO flights(name, started_at, last_activity, ended_at, "
+                "payload_callsign) VALUES (?,?,?,?,?)", (name, start, end, end, call))
+
+    rows = client.get("/api/v1/admin/flights", headers={"X-Admin-Password": "hunter2"}).json()
+    overlaps = {r["name"]: sorted(r["overlaps"]) for r in rows}
+    ids = {r["name"]: r["id"] for r in rows}
+    assert overlaps["tagged"] == sorted([ids["twin"], ids["startup"]])
+    assert overlaps["startup"] == [ids["tagged"]]
+    # The untagged twin overlaps VK5ARG too, and could be half of either.
+    assert overlaps["twin"] == sorted([ids["tagged"], ids["other balloon"]])
+    assert overlaps["later"] == []
+
+
+def test_admin_page_is_served_at_a_path_nginx_will_not_take_for_a_callsign(client):
+    assert client.get("/admin", follow_redirects=False).headers["location"] == "/admin/"
+    page = client.get("/admin/")
+    assert page.status_code == 200
+    assert "/static/js/admin.js" in page.text

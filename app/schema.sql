@@ -29,12 +29,20 @@ CREATE TABLE IF NOT EXISTS flights (
   -- up-burst-down, so identity is (callsign, silence gap) rather than time
   -- alone: two balloons in the air at once, or a neighbour's beacon the
   -- receiver happens to hear, are separate flights however much they overlap.
-  -- NULL is its own identity, not a wildcard -- it means the receiver never
-  -- named the transmitter (older firmware, or a spool file written before the
-  -- field existed), which cannot be assumed to be any callsign in particular.
-  payload_callsign TEXT
+  -- NULL means no receiver has named the transmitter yet. Untagged packets
+  -- join a tagged flight wherever they evidently belong to one (see
+  -- Store._current_flight), so a NULL flight is either one still waiting for
+  -- its callsign or traffic that genuinely could not be placed.
+  payload_callsign TEXT,
+  -- Left out of the public flight list. Housekeeping, not access control.
+  hidden        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_flights_open ON flights(ended_at, last_activity);
+-- At most one open flight per callsign, and one untagged. Two open flights for
+-- one transmitter is how its telemetry ends up split between them, so this is
+-- enforced by the database rather than left to the ingest logic alone.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flights_one_open
+  ON flights(COALESCE(payload_callsign, '')) WHERE ended_at IS NULL;
 
 -- One row per distinct packet `id` string. One physical payload emits several
 -- of these (sensor_task -> RAB_HAT_ENV, sensor_task_lsm6dso -> RAB_HAT_LSM6DSOX),
@@ -135,6 +143,11 @@ CREATE TABLE IF NOT EXISTS readings (
 -- means a function call per row, which is what made the first altitude join
 -- take two minutes. Eight bytes a row buys an index that serves both.
 CREATE INDEX IF NOT EXISTS idx_readings_series ON readings(field_id, ts_epoch);
+-- For ON DELETE CASCADE from packets. Without it SQLite finds a deleted
+-- packet's readings by scanning the whole table, once per packet -- merging
+-- two halves of a real flight deletes thousands of duplicate packets, and on
+-- a 3.7M-reading database that took hours instead of seconds.
+CREATE INDEX IF NOT EXISTS idx_readings_packet ON readings(packet_id);
 
 -- Wenet GPS_TELEMETRY (packet type 0x01). Keyed per flight: the GPS transmitter
 -- is assumed to be on the same balloon string as the BLE sensors, which is what

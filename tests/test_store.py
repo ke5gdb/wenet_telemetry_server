@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -415,17 +416,270 @@ def test_two_transmitters_sharing_a_gps_second_both_survive(store):
     assert alts == [1000.0, 2000.0]
 
 
-def test_untagged_traffic_is_its_own_flight(store):
-    """Absence is an identity, not a wildcard.
+def fix_at(offset_s, lat, lon, callsign=None, alt=1000.0):
+    item = gps_point(offset_s, callsign, alt)
+    item["data"].update(latitude=lat, longitude=lon)
+    return item
 
-    A receiver on older firmware never names the transmitter, so its packets
-    cannot be assumed to belong to the one that was named.
+
+AUSTIN = (30.1, -97.7)
+ADELAIDE = (-34.9, 138.6)
+
+
+def open_flights(store):
+    return rows(store, "SELECT id, payload_callsign FROM flights WHERE ended_at IS NULL")
+
+
+def test_untagged_traffic_joins_the_only_tagged_flight(store):
+    """The twin-flight bug, as it happened on 2026-10-24.
+
+    Receivers too old to name the transmitter, and every receiver before its
+    first decoded image, send no callsign. Filing those as a flight of their
+    own split one balloon's telemetry across two flights running side by side.
     """
     store.ingest("KE5GDB", [with_callsign(packet(count=1, v_in=4.0), "KE5GDB")])
-    store.ingest("K5NBC", [packet(source="OTHER_ENV", count=1, v_in=4.0)])
+    store.ingest("KA5BOU", [packet(source="OTHER_ENV", count=1, v_in=4.0),
+                            gps_point(callsign=None)])
 
-    flights = rows(store, "SELECT payload_callsign FROM flights ORDER BY id")
-    assert [f["payload_callsign"] for f in flights] == ["KE5GDB", None]
+    assert scalar(store, "SELECT COUNT(*) FROM flights") == 1
+    assert scalar(store, "SELECT COUNT(DISTINCT flight_id) FROM sources") == 1
+    assert scalar(store, "SELECT flight_id FROM gps") == 1
+
+
+def test_one_packet_from_a_tagged_and_an_untagged_station_is_stored_once(store):
+    """Split across two flights, the dedup key never saw the second copy."""
+    item = packet(count=7, v_in=4.0)
+    store.ingest("K5MGY", [with_callsign(item, "KE5GDB")])
+    store.ingest("KA5BOU", [item])
+
+    assert scalar(store, "SELECT COUNT(*) FROM packets") == 1
+    assert scalar(store, "SELECT COUNT(*) FROM receptions") == 2
+
+
+def test_untagged_sensor_follows_its_source_between_two_balloons(store):
+    store.ingest("KE5GDB", [
+        with_callsign(packet(source="GDB_ENV_ENV", count=1, v_in=4.0), "KE5GDB"),
+        with_callsign(packet(source="RAB_22_ENV", count=1, v_in=3.9), "W5XYZ"),
+    ])
+    w5xyz = scalar(store, "SELECT id FROM flights WHERE payload_callsign='W5XYZ'")
+
+    store.ingest("KA5BOU", [packet(source="RAB_22_ENV", count=2, v_in=3.8)])
+
+    assert scalar(store, "SELECT COUNT(*) FROM flights") == 2
+    assert scalar(store, "SELECT COUNT(*) FROM sources WHERE flight_id=?", (w5xyz,)) == 1
+    assert scalar(store, "SELECT packet_count FROM sources WHERE flight_id=?",
+                  (w5xyz,)) == 2
+
+
+def test_untagged_fix_goes_to_the_nearest_balloon(store):
+    store.ingest("KE5GDB", [fix_at(0, *AUSTIN, callsign="KE5GDB"),
+                            fix_at(0, *ADELAIDE, callsign="VK5ARG")])
+    vk = scalar(store, "SELECT id FROM flights WHERE payload_callsign='VK5ARG'")
+
+    store.ingest("VK5KX", [fix_at(1, ADELAIDE[0] + 0.05, ADELAIDE[1], alt=1200.0)])
+
+    assert scalar(store, "SELECT COUNT(*) FROM flights") == 2
+    assert scalar(store, "SELECT flight_id FROM gps WHERE altitude=1200.0") == vk
+
+
+def test_untagged_fix_far_from_every_flight_stays_apart(store):
+    """Somebody else's balloon, heard by a receiver that cannot name it."""
+    store.ingest("KE5GDB", [fix_at(0, *AUSTIN, callsign="KE5GDB")])
+    store.ingest("VK5KX", [fix_at(1, *ADELAIDE)])
+
+    assert sorted(f["payload_callsign"] or "" for f in open_flights(store)) == ["", "KE5GDB"]
+
+
+def test_untagged_traffic_that_could_be_either_balloon_stays_apart(store):
+    """No source match, no position, two candidates: guessing would be worse."""
+    store.ingest("KE5GDB", [
+        with_callsign(packet(source="GDB_ENV_ENV", count=1, v_in=4.0), "KE5GDB"),
+        with_callsign(packet(source="RAB_22_ENV", count=1, v_in=3.9), "W5XYZ"),
+    ])
+    store.ingest("KA5BOU", [packet(source="NEW_ENV", count=1, v_in=3.9)])
+
+    assert sorted(f["payload_callsign"] or "" for f in open_flights(store)) == [
+        "", "KE5GDB", "W5XYZ"]
+
+
+def test_untagged_source_already_in_the_untagged_flight_stays_there(store):
+    store.ingest("KE5GDB", [
+        with_callsign(packet(source="GDB_ENV_ENV", count=1, v_in=4.0), "KE5GDB"),
+        with_callsign(packet(source="RAB_22_ENV", count=1, v_in=3.9), "W5XYZ"),
+    ])
+    store.ingest("KA5BOU", [packet(source="NEW_ENV", count=1, v_in=3.9)])
+    store.ingest("KA5BOU", [packet(source="NEW_ENV", count=2, v_in=3.9)])
+
+    untagged = scalar(store, "SELECT id FROM flights WHERE payload_callsign IS NULL")
+    assert scalar(store, "SELECT packet_count FROM sources WHERE flight_id=?",
+                  (untagged,)) == 2
+
+
+def test_first_tagged_packet_claims_the_untagged_start(store):
+    """A receiver sends untagged until it decodes its first image.
+
+    Those first seconds used to become a flight of their own, and the named
+    packets that followed opened a second one beside it.
+    """
+    store.ingest("KE5GDB-SatRig", [full_gps(0, callsign=None)])
+    store.ingest("KE5GDB-SatRig", [full_gps(1, callsign="KE5GDB")])
+
+    flights = rows(store, "SELECT * FROM flights")
+    assert len(flights) == 1
+    assert flights[0]["payload_callsign"] == "KE5GDB"
+    assert flights[0]["name"].endswith(" - KE5GDB #1")
+    # One telemetry source for the transmitter, not WENET_GPS beside it.
+    keys = [r[0] for r in rows(store, "SELECT source_key FROM sources WHERE kind='gps'")]
+    assert keys == ["KE5GDB_GPS"]
+    assert scalar(store, "SELECT packet_count FROM sources") == 2
+    # Later untagged fixes from the same transmitter land on that source too.
+    store.ingest("KA5BOU", [full_gps(2, callsign=None)])
+    assert scalar(store, "SELECT packet_count FROM sources") == 3
+
+
+def test_claiming_keeps_a_name_someone_chose(store):
+    store.ingest("KE5GDB", [packet(count=1, v_in=4.0)])
+    store.update_flight(1, name="Pad test")
+    store.ingest("KE5GDB", [with_callsign(packet(count=2, v_in=4.0), "KE5GDB")])
+
+    assert scalar(store, "SELECT name FROM flights") == "Pad test"
+    assert scalar(store, "SELECT payload_callsign FROM flights") == "KE5GDB"
+
+
+def test_untagged_flight_is_not_claimed_from_the_other_side_of_the_world(store):
+    store.ingest("VK5KX", [fix_at(0, *ADELAIDE)])
+    store.ingest("KE5GDB", [fix_at(1, *AUSTIN, callsign="KE5GDB")])
+
+    assert sorted(f["payload_callsign"] or "" for f in open_flights(store)) == ["", "KE5GDB"]
+
+
+def test_database_refuses_a_second_open_flight_for_a_callsign(store):
+    store.ingest("KE5GDB", [with_callsign(packet(count=1, v_in=4.0), "KE5GDB")])
+    conn = store.pool.get()
+    with pytest.raises(sqlite3.IntegrityError):
+        with conn:
+            conn.execute(
+                "INSERT INTO flights(name, started_at, last_activity, payload_callsign) "
+                "VALUES ('dup', ?, ?, 'KE5GDB')", (iso(T0), iso(T0)))
+
+
+def test_startup_closes_duplicate_open_flights_left_by_older_code(tmp_path):
+    path = tmp_path / "old.db"
+    s = Store(path)
+    conn = s.pool.get()
+    with conn:
+        conn.execute("DROP INDEX idx_flights_one_open")
+        for i, last in enumerate(["2026-10-24T13:00:00Z", "2026-10-24T16:00:00Z"]):
+            conn.execute(
+                "INSERT INTO flights(name, started_at, last_activity, payload_callsign) "
+                "VALUES (?, ?, ?, 'K5RWK')", (f"f{i}", last, last))
+    s.close()
+
+    s = Store(path)
+    still_open = rows(s, "SELECT name FROM flights WHERE ended_at IS NULL")
+    assert [r["name"] for r in still_open] == ["f1"]
+    assert scalar(s, "SELECT ended_at FROM flights WHERE name='f0'") == "2026-10-24T13:00:00Z"
+    s.close()
+
+
+# -- repairing what the old ingest did -----------------------------------
+
+
+def legacy_twins(store):
+    """The pair of flights ingest used to make: untagged and tagged, overlapping."""
+    shared = packet(count=1, v_in=4.0)
+    store.ingest("KA5BOU", [shared, packet(count=2, v_in=4.1), full_gps(0, callsign=None)])
+    store.close_flight(1)
+    store.ingest("K5MGY", [with_callsign(shared, "KE5GDB"),
+                           with_callsign(packet(count=3, v_in=4.2), "KE5GDB"),
+                           full_gps(0, callsign="KE5GDB"), full_gps(1, callsign="KE5GDB")])
+    return 2, 1   # tagged, untagged
+
+
+def test_merge_keeps_every_station_s_receptions(store):
+    tagged, untagged = legacy_twins(store)
+
+    store.merge_flights(tagged, untagged)
+
+    assert scalar(store, "SELECT COUNT(*) FROM packets p JOIN sources s ON s.id=p.source_id "
+                         "WHERE s.kind='sensor'") == 3
+    assert scalar(store, "SELECT COUNT(*) FROM gps") == 2
+    by_station = {r["reporter_id"]: r for r in store.reporters(tagged)}
+    # KA5BOU heard two sensor packets and one fix; the fix and one packet were
+    # duplicates of K5MGY's, which is exactly what a merge used to discard.
+    assert by_station["KA5BOU"]["sensor"] == 2
+    assert by_station["KA5BOU"]["gps"] == 1
+    assert by_station["K5MGY"]["sensor"] == 2
+    assert by_station["K5MGY"]["gps"] == 2
+
+
+def test_merge_folds_the_untagged_gps_source_into_the_transmitter_s(store):
+    tagged, untagged = legacy_twins(store)
+
+    store.merge_flights(tagged, untagged)
+
+    gps_sources = rows(store, "SELECT source_key, packet_count FROM sources WHERE kind='gps'")
+    assert [(r[0], r[1]) for r in gps_sources] == [("KE5GDB_GPS", 2)]
+
+
+def test_merge_into_the_untagged_flight_takes_the_callsign_and_its_name(store):
+    tagged, untagged = legacy_twins(store)
+
+    store.merge_flights(untagged, tagged)
+
+    flight = rows(store, "SELECT * FROM flights")[0]
+    assert flight["payload_callsign"] == "KE5GDB"
+    assert flight["ended_at"] is None            # the tagged half was still open
+    assert " - KE5GDB #" in flight["name"]
+    assert [r[0] for r in rows(store, "SELECT source_key FROM sources WHERE kind='gps'")] \
+        == ["KE5GDB_GPS"]
+
+
+def test_merge_will_not_leave_two_flights_open_for_one_callsign(store):
+    store.ingest("KE5GDB", [fix_at(0, *AUSTIN, callsign="KE5GDB")])
+    store.close_flight(1)
+    store.ingest("VK5KX", [fix_at(1, *ADELAIDE)])                     # 2: untagged, open
+    store.ingest("KE5GDB", [fix_at(2, *AUSTIN, callsign="KE5GDB")])   # 3: too far to claim 2
+    assert {r["id"] for r in open_flights(store)} == {2, 3}
+
+    # Closed KE5GDB + open untagged would be an open KE5GDB flight beside 3.
+    with pytest.raises(ValueError, match="already open"):
+        store.merge_flights(1, 2)
+    assert scalar(store, "SELECT COUNT(*) FROM flights") == 3     # rolled back
+
+
+# -- split and hide ---------------------------------------------------------
+
+
+def test_split_keeps_the_callsign_and_leaves_one_flight_open(store):
+    store.ingest("KE5GDB", [full_gps(0), full_gps(100),
+                            with_callsign(packet(count=1, offset_s=100), "KE5GDB")])
+
+    out = store.split_flight(1, iso(T0 + timedelta(seconds=50)))
+
+    later = rows(store, "SELECT * FROM flights WHERE id=?", (out["new_flight_id"],))[0]
+    assert later["payload_callsign"] == "KE5GDB"
+    assert later["ended_at"] is None
+    assert scalar(store, "SELECT ended_at FROM flights WHERE id=1") is not None
+    kinds = {r[0]: r[1] for r in rows(
+        store, "SELECT source_key, kind FROM sources WHERE flight_id=?", (later["id"],))}
+    assert kinds["KE5GDB_GPS"] == "gps"
+    # And the open half keeps taking the transmitter's packets.
+    store.ingest("KE5GDB", [full_gps(101)])
+    assert scalar(store, "SELECT COUNT(*) FROM flights") == 2
+
+
+def test_hiding_an_open_flight_closes_it_and_drops_it_from_the_list(store):
+    store.ingest("KE5GDB", [with_callsign(packet(count=1, v_in=4.0), "KE5GDB")])
+
+    row = store.update_flight(1, hidden=True)
+
+    assert row["hidden"] == 1 and row["ended_at"] is not None
+    assert store.flights() == []
+    assert [f["id"] for f in store.flights(include_hidden=True)] == [1]
+    # The next packet starts a visible flight instead of vanishing into it.
+    store.ingest("KE5GDB", [with_callsign(packet(count=2, v_in=4.0), "KE5GDB")])
+    assert [f["id"] for f in store.flights()] == [2]
 
 
 def test_same_transmitter_within_the_gap_is_one_flight(store):

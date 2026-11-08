@@ -13,6 +13,8 @@ from __future__ import annotations
 import bisect
 import json
 import logging
+import math
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field as dc_field
@@ -79,6 +81,39 @@ def rate_from_epochs(epochs: list[float]) -> float:
     if span <= 0:
         return 0.0
     return (len(epochs) - 1) / span
+
+#: How far an untagged GPS fix may be from a flight's latest fix and still be
+#: filed with it. This only has to tell apart balloons that are plainly not
+#: the same one: within a 30-minute flight gap a balloon in a 50 m/s jet stream
+#: covers ~90 km, while an unrelated transmitter is usually on another
+#: continent. Where two flights are both in reach, the nearer one wins anyway.
+ATTRIBUTION_MAX_KM = 100.0
+
+#: A name `_create_flight` generated, as opposed to one a person chose. Only
+#: these are rewritten when a flight learns its callsign.
+_AUTO_NAME = re.compile(r"^Flight \d{4}-\d{2}-\d{2}( - \S+)? #\d+$")
+
+
+def distance_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Great-circle distance between two (lat, lon) points."""
+    lat1, lon1, lat2, lon2 = map(math.radians, (*a, *b))
+    h = (math.sin((lat2 - lat1) / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
+    return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(h)))
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """What a packet says about which flight it belongs to, besides a callsign.
+
+    Needed because the callsign is frequently missing. The Wenet receiver
+    learns it from SSDV image packets, so everything it hears before the first
+    image decodes goes out untagged -- and a receiver on a build older than the
+    callsign passthrough never tags anything at all.
+    """
+    source_key: str | None = None
+    position: tuple[float, float] | None = None
+
 
 #: Columns of the GPS table that arrive as named fields; anything else in a GPS
 #: packet is preserved in `extra` rather than dropped.
@@ -374,7 +409,9 @@ class Store:
             count = -1
             truncated = True
 
-        flight_id = self._current_flight(conn, received_at, callsign)
+        flight_id = self._current_flight(
+            conn, received_at, callsign, Evidence(source_key=source_key)
+        )
         result.flight_id = flight_id
         result.flight_ids.add(flight_id)
         source_id = self._get_source(
@@ -503,10 +540,6 @@ class Store:
                              f"gps bad time: {exc}", data, result)
                 return
 
-        flight_id = self._current_flight(conn, received_at, callsign)
-        result.flight_id = flight_id
-        result.flight_ids.add(flight_id)
-
         values: dict[str, Any] = {}
         extra: dict[str, Any] = {}
         for key, value in data.items():
@@ -518,6 +551,17 @@ class Store:
             else:
                 extra[key] = value
         extra.setdefault("time_source", time_source)
+
+        lat, lon = values.get("latitude"), values.get("longitude")
+        position = None
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (lat, lon)):
+            position = (float(lat), float(lon))
+
+        flight_id = self._current_flight(
+            conn, received_at, callsign, Evidence(position=position)
+        )
+        result.flight_id = flight_id
+        result.flight_ids.add(flight_id)
 
         cur = conn.execute(
             "INSERT OR IGNORE INTO gps"
@@ -579,9 +623,10 @@ class Store:
     def gps_source_key(self, callsign: str | None) -> str:
         """Key for the synthesised source carrying GPS telemetry as series.
 
-        Qualified with the callsign where there is one, which is safe because a
-        flight *is* one transmitter -- the callsign cannot change inside a
-        flight, since a different one resolves to a different flight.
+        Qualified with the flight's callsign where it has one, which is safe
+        because a flight *is* one transmitter. The one change it can undergo is
+        an untagged flight learning its callsign, and `_adopt_gps_source`
+        renames the key when that happens.
         """
         return f"{callsign}_{_GPS_TASK}" if callsign else f"WENET_{_GPS_TASK}"
 
@@ -607,10 +652,17 @@ class Store:
         if not series:
             return False
 
-        source_key = self.gps_source_key(callsign)
+        # Keyed on the flight's callsign, not the packet's. `callsign` is what
+        # this one receiver reported, and may be absent even though the flight
+        # is known to be KE5GDB's -- keying on it would give one transmitter two
+        # telemetry sources, `KE5GDB_GPS` and `WENET_GPS`, splitting its
+        # housekeeping across both. The packet row below still records the raw
+        # fact.
+        flight_callsign = self._flight_callsign(conn, flight_id)
+        source_key = self.gps_source_key(flight_callsign)
         source_id = self._get_source(
             conn, flight_id, source_key, data, ts, result,
-            names=(callsign or "Wenet", _GPS_TASK), kind="gps",
+            names=(flight_callsign or "Wenet", _GPS_TASK), kind="gps",
         )
 
         # This packet *is* a fix, so its altitude needs no interpolating -- it
@@ -799,7 +851,11 @@ class Store:
     # -- lookups ----------------------------------------------------------
 
     def _current_flight(
-        self, conn: sqlite3.Connection, now: str, callsign: str | None = None
+        self,
+        conn: sqlite3.Connection,
+        now: str,
+        callsign: str | None = None,
+        evidence: Evidence | None = None,
     ) -> int:
         """The open flight for one transmitter, or a new one.
 
@@ -810,27 +866,188 @@ class Store:
         their own. What must not share a flight is two transmitters, whose
         times overlap freely and whose GPS streams are two different balloons.
 
+        A missing callsign is *not* its own identity. It is what a receiver
+        sends before it has decoded an image, and all an older receiver ever
+        sends, so treating it as a separate transmitter gave every flight an
+        untagged twin running alongside it with part of its telemetry. An
+        untagged packet joins the tagged flight it evidently belongs to, and
+        the first tagged packet claims an untagged flight already under way.
+        Only when nothing can tell which tagged flight an untagged packet is
+        from does it stay in an untagged flight of its own.
+
         ``IS`` rather than ``=`` so the no-callsign case matches itself: in
         SQLite ``NULL = NULL`` is NULL, which would open a fresh flight for
         every untagged packet.
         """
+        evidence = evidence or Evidence()
+        if callsign is None:
+            owner = self._attribute_untagged(conn, now, evidence)
+            if owner is not None:
+                return owner
+
+        # At most one row, by the unique index on open flights.
         row = conn.execute(
             "SELECT id, last_activity FROM flights "
-            "WHERE ended_at IS NULL AND payload_callsign IS ? "
-            "ORDER BY last_activity DESC LIMIT 1",
+            "WHERE ended_at IS NULL AND payload_callsign IS ?",
             (callsign,),
         ).fetchone()
 
         if row is not None:
-            gap = (parse_ts(now) - parse_ts(row["last_activity"])).total_seconds()
-            if gap <= self.flight_gap_seconds:
+            if self._gap(now, row["last_activity"]) <= self.flight_gap_seconds:
                 return row["id"]
             # Silence long enough to call it: close the old flight at its last
             # real activity rather than now, so the record does not claim hours
             # of flight time that were actually silence.
             self._end_flight(conn, row["id"], row["last_activity"])
 
+        if callsign is not None:
+            claimed = self._claim_untagged(conn, now, callsign, evidence)
+            if claimed is not None:
+                return claimed
+
         return self._create_flight(conn, now, callsign)
+
+    @staticmethod
+    def _gap(now: str, last_activity: str) -> float:
+        return (parse_ts(now) - parse_ts(last_activity)).total_seconds()
+
+    def _live_flights(self, conn: sqlite3.Connection, now: str) -> list[sqlite3.Row]:
+        """Open flights that `now` is still within the gap of, newest first."""
+        rows = conn.execute(
+            "SELECT id, name, payload_callsign, started_at, last_activity FROM flights "
+            "WHERE ended_at IS NULL ORDER BY last_activity DESC"
+        ).fetchall()
+        return [r for r in rows
+                if self._gap(now, r["last_activity"]) <= self.flight_gap_seconds]
+
+    def _last_fix(self, conn: sqlite3.Connection, flight_id: int) -> tuple[float, float] | None:
+        row = conn.execute(
+            "SELECT latitude, longitude FROM gps WHERE flight_id=? "
+            "AND latitude IS NOT NULL AND longitude IS NOT NULL "
+            "ORDER BY time_epoch DESC LIMIT 1",
+            (flight_id,),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def _attribute_untagged(
+        self, conn: sqlite3.Connection, now: str, evidence: Evidence
+    ) -> int | None:
+        """The tagged flight an untagged packet belongs to, or None to keep it apart.
+
+        In order of how much the packet gives away:
+
+        1. Its source already exists in a live flight. A sensor payload is on
+           one balloon, so that is the flight -- unless the source is in the
+           untagged flight only, which already says where it goes.
+        2. It is a fix. It goes with the nearest live flight, if that one is
+           tagged and within `ATTRIBUTION_MAX_KM`.
+        3. Otherwise, if exactly one tagged flight is live, it is that one. This
+           is the ordinary case -- one balloon up, some receivers too old to
+           name it -- and the one that was producing the twin flights.
+
+        GPS timestamps are deliberately not evidence: every transmitter's fixes
+        land on whole GPS seconds, so two balloons share them constantly.
+        """
+        live = self._live_flights(conn, now)
+        tagged = [r["id"] for r in live if r["payload_callsign"] is not None]
+        if not tagged:
+            return None
+        ids = [r["id"] for r in live]
+        marks = ",".join("?" * len(ids))
+
+        if evidence.source_key is not None:
+            holders = {r[0] for r in conn.execute(
+                f"SELECT flight_id FROM sources WHERE source_key=? AND flight_id IN ({marks})",
+                (evidence.source_key, *ids),
+            )}
+            for fid in tagged:              # newest activity first
+                if fid in holders:
+                    return fid
+            if holders:
+                return None
+
+        if evidence.position is not None:
+            reach = []
+            for fid in ids:
+                fix = self._last_fix(conn, fid)
+                if fix is not None:
+                    reach.append((distance_km(evidence.position, fix), fid))
+            if reach:
+                km, nearest = min(reach)
+                if nearest in tagged and km <= ATTRIBUTION_MAX_KM:
+                    return nearest
+                return None
+
+        return tagged[0] if len(tagged) == 1 else None
+
+    def _claim_untagged(
+        self, conn: sqlite3.Connection, now: str, callsign: str, evidence: Evidence
+    ) -> int | None:
+        """Give a live untagged flight to the first callsign heard, if it fits.
+
+        The untagged flight is usually this transmitter's own first minutes,
+        heard before any receiver had decoded an image to learn the callsign
+        from. The one thing that rules it out is a fix that is plainly
+        somewhere else.
+        """
+        row = conn.execute(
+            "SELECT id, name, started_at, last_activity FROM flights "
+            "WHERE ended_at IS NULL AND payload_callsign IS NULL"
+        ).fetchone()
+        if row is None or self._gap(now, row["last_activity"]) > self.flight_gap_seconds:
+            return None
+        if evidence.position is not None:
+            fix = self._last_fix(conn, row["id"])
+            if fix is not None and distance_km(evidence.position, fix) > ATTRIBUTION_MAX_KM:
+                return None
+        self._assign_callsign(conn, row["id"], callsign)
+        log.info("flight %s claimed by %s", row["id"], callsign)
+        return row["id"]
+
+    def _assign_callsign(self, conn: sqlite3.Connection, flight_id: int, callsign: str) -> None:
+        """Tag a flight with its transmitter, renaming what was named for it.
+
+        The caller guarantees no other open flight carries `callsign`.
+        """
+        row = conn.execute(
+            "SELECT name, started_at FROM flights WHERE id=?", (flight_id,)
+        ).fetchone()
+        name = row["name"]
+        if _AUTO_NAME.match(name):
+            name = self._flight_name(conn, row["started_at"], callsign)
+        conn.execute(
+            "UPDATE flights SET payload_callsign=?, name=? WHERE id=?",
+            (callsign, name, flight_id),
+        )
+        self._adopt_gps_source(conn, flight_id, callsign)
+
+    def _adopt_gps_source(self, conn: sqlite3.Connection, flight_id: int, callsign: str) -> None:
+        """Re-key a flight's untagged GPS telemetry source to its callsign."""
+        old = conn.execute(
+            "SELECT * FROM sources WHERE flight_id=? AND source_key=?",
+            (flight_id, self.gps_source_key(None)),
+        ).fetchone()
+        if old is None:
+            return
+        twin = conn.execute(
+            "SELECT * FROM sources WHERE flight_id=? AND source_key=?",
+            (flight_id, self.gps_source_key(callsign)),
+        ).fetchone()
+        if twin is None:
+            conn.execute(
+                "UPDATE sources SET source_key=?, payload_name=? WHERE id=?",
+                (self.gps_source_key(callsign), callsign, old["id"]),
+            )
+        else:
+            self._fold_source(conn, old, twin)
+        self._source_cache.clear()
+        self._field_cache.clear()
+
+    def _flight_callsign(self, conn: sqlite3.Connection, flight_id: int) -> str | None:
+        row = conn.execute(
+            "SELECT payload_callsign FROM flights WHERE id=?", (flight_id,)
+        ).fetchone()
+        return row[0] if row else None
 
     def _end_flight(self, conn: sqlite3.Connection, flight_id: int, ended_at: str) -> None:
         conn.execute("UPDATE flights SET ended_at=? WHERE id=?", (ended_at, flight_id))
@@ -851,30 +1068,32 @@ class Store:
         are only ever a handful of open flights, but there is no reason to scan
         them 15 times for one POST.
         """
-        cutoff = parse_ts(now)
         for row in conn.execute(
             "SELECT id, last_activity FROM flights WHERE ended_at IS NULL"
         ).fetchall():
-            gap = (cutoff - parse_ts(row["last_activity"])).total_seconds()
-            if gap > self.flight_gap_seconds:
+            if self._gap(now, row["last_activity"]) > self.flight_gap_seconds:
                 self._end_flight(conn, row["id"], row["last_activity"])
 
-    def _create_flight(
-        self, conn: sqlite3.Connection, now: str, callsign: str | None = None
-    ) -> int:
-        day = now[:10]
+    @staticmethod
+    def _flight_name(conn: sqlite3.Connection, started_at: str, callsign: str | None) -> str:
         # "Flight 2026-08-15 - KE5GDB #1". Counted per transmitter per day
         # rather than per day, so two transmitters flying the same afternoon are
         # each their own #1 instead of one of them being arbitrarily "#2".
         # Numbered from the first, because "#1" reads as a flight of several and
         # a bare name reads as the only one -- and on a launch day it is rarely
         # the only one.
+        day = started_at[:10]
         base = f"Flight {day} - {callsign}" if callsign else f"Flight {day}"
         same = conn.execute(
             "SELECT COUNT(*) FROM flights WHERE name = ? OR name LIKE ?",
             (base, base + " #%"),
         ).fetchone()[0]
-        name = f"{base} #{same + 1}"
+        return f"{base} #{same + 1}"
+
+    def _create_flight(
+        self, conn: sqlite3.Connection, now: str, callsign: str | None = None
+    ) -> int:
+        name = self._flight_name(conn, now, callsign)
         cur = conn.execute(
             "INSERT INTO flights(name, started_at, last_activity, payload_callsign) "
             "VALUES (?,?,?,?)",
@@ -980,16 +1199,29 @@ class Store:
 
     # -- read side (minimal for now; the full read API lands in step 3) ----
 
-    def flights(self) -> list[dict]:
+    def flights(self, include_hidden: bool = False) -> list[dict]:
+        """Every flight, newest first. Hidden ones only when asked for.
+
+        Hiding is a tidiness feature, not access control: a hidden flight's
+        data is still served to anyone who asks for it by id.
+        """
         rows = self.pool.get().execute(
             "SELECT f.*, "
             " (SELECT COUNT(*) FROM sources s WHERE s.flight_id=f.id) AS source_count, "
             " (SELECT COUNT(*) FROM packets p JOIN sources s ON s.id=p.source_id "
             "  WHERE s.flight_id=f.id) AS packet_count, "
             " (SELECT COUNT(*) FROM gps g WHERE g.flight_id=f.id) AS gps_count "
-            "FROM flights f ORDER BY f.started_at DESC"
+            "FROM flights f "
+            + ("" if include_hidden else "WHERE f.hidden=0 ")
+            + "ORDER BY f.started_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def flight(self, flight_id: int) -> dict | None:
+        row = self.pool.get().execute(
+            "SELECT * FROM flights WHERE id=?", (flight_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     def sources(self, flight_id: int) -> list[dict]:
         conn = self.pool.get()
@@ -1346,7 +1578,13 @@ class Store:
 
     # -- flight administration --------------------------------------------
 
-    def update_flight(self, flight_id: int, name: str | None, notes: str | None) -> dict | None:
+    def update_flight(
+        self,
+        flight_id: int,
+        name: str | None = None,
+        notes: str | None = None,
+        hidden: bool | None = None,
+    ) -> dict | None:
         conn = self.pool.get()
         with self._write_lock, conn:
             sets, params = [], []
@@ -1356,11 +1594,21 @@ class Store:
             if notes is not None:
                 sets.append("notes=?")
                 params.append(notes)
+            if hidden is not None:
+                sets.append("hidden=?")
+                params.append(int(hidden))
             if sets:
                 params.append(flight_id)
                 conn.execute(f"UPDATE flights SET {', '.join(sets)} WHERE id=?", params)
-        row = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
-        return dict(row) if row else None
+            row = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if row is None:
+            return None
+        # A hidden flight that stayed open would keep taking packets -- so a
+        # test flight hidden on the pad would swallow the real launch where no
+        # one can see it. Closing it means the next packet opens a fresh one.
+        if hidden and row["ended_at"] is None:
+            return self.close_flight(flight_id)
+        return dict(row)
 
     def close_flight(self, flight_id: int) -> dict | None:
         """End a flight now rather than waiting for the silence gap to notice."""
@@ -1431,7 +1679,16 @@ class Store:
                 moved_sources += 1
 
             # GPS is keyed per flight, so drop any instant the target already has
-            # before repointing -- the same fix heard twice is one fix.
+            # before repointing -- the same fix heard twice is one fix. Who
+            # heard it is kept: those are two stations' receptions of it, and
+            # the reporters panel is the only record of the second one.
+            conn.execute(
+                "INSERT OR IGNORE INTO gps_receptions(gps_id, reporter_id, received_at) "
+                "SELECT t.id, r.reporter_id, r.received_at FROM gps s "
+                "JOIN gps t ON t.flight_id=? AND t.timestamp=s.timestamp "
+                "JOIN gps_receptions r ON r.gps_id=s.id WHERE s.flight_id=?",
+                (target_id, source_id),
+            )
             conn.execute(
                 "DELETE FROM gps WHERE flight_id=? AND timestamp IN "
                 "(SELECT timestamp FROM gps WHERE flight_id=?)",
@@ -1442,16 +1699,36 @@ class Store:
 
             span = conn.execute(
                 "SELECT MIN(started_at) s, MAX(last_activity) a, "
-                "       SUM(ended_at IS NULL) open FROM flights WHERE id IN (?,?)",
+                "       SUM(ended_at IS NULL) open, MIN(hidden) hidden "
+                "FROM flights WHERE id IN (?,?)",
                 (target_id, source_id),
             ).fetchone()
             ended = None if span["open"] else span["a"]
-            conn.execute(
-                "UPDATE flights SET started_at=?, last_activity=?, ended_at=?, "
-                "payload_callsign=? WHERE id=?",
-                (span["s"], span["a"], ended, merged_callsign, target_id),
-            )
+            if ended is None:
+                clash = conn.execute(
+                    "SELECT id FROM flights WHERE ended_at IS NULL AND id NOT IN (?,?) "
+                    "AND payload_callsign IS ?",
+                    (target_id, source_id, merged_callsign),
+                ).fetchone()
+                if clash is not None:
+                    raise ValueError(
+                        f"flight {clash['id']} is already open for "
+                        f"{merged_callsign or 'untagged traffic'}; close it first"
+                    )
+            # The source goes first: until it does, it may be the one other
+            # open flight for this callsign, and the unique index checks each
+            # statement as it runs rather than at commit.
             conn.execute("DELETE FROM flights WHERE id=?", (source_id,))
+            conn.execute(
+                "UPDATE flights SET started_at=?, last_activity=?, ended_at=?, hidden=? "
+                "WHERE id=?",
+                (span["s"], span["a"], ended, span["hidden"], target_id),
+            )
+            if merged_callsign and calls[target_id] is None:
+                self._assign_callsign(conn, target_id, merged_callsign)
+            elif merged_callsign:
+                # Its untagged twin brought a `WENET_GPS` source with it.
+                self._adopt_gps_source(conn, target_id, merged_callsign)
 
         self._source_cache.clear()
         self._field_cache.clear()
@@ -1483,7 +1760,16 @@ class Store:
             conn.execute("DELETE FROM fields WHERE id=?", (field["id"],))
 
         # A packet the target already holds is the same transmission, not a new
-        # sample; drop it rather than violating the dedup key on the way in.
+        # sample; drop it rather than violating the dedup key on the way in --
+        # but keep who heard it, which is the whole of what the copy adds.
+        conn.execute(
+            "INSERT OR IGNORE INTO receptions(packet_id, reporter_id, received_at) "
+            "SELECT t.id, r.reporter_id, r.received_at FROM packets s "
+            "JOIN packets t ON t.source_id=? AND t.payload_time=s.payload_time "
+            "AND t.count=s.count "
+            "JOIN receptions r ON r.packet_id=s.id WHERE s.source_id=?",
+            (twin["id"], src["id"]),
+        )
         conn.execute(
             "DELETE FROM packets WHERE source_id=? AND (payload_time, count) IN "
             "(SELECT payload_time, count FROM packets WHERE source_id=?)",
@@ -1516,7 +1802,19 @@ class Store:
             if not moving:
                 raise ValueError("nothing falls after that time")
 
-            new_id = self._create_flight(conn, iso(at))
+            # The earlier half is closed at the cut first, and the later half
+            # inherits the flight's state: if it was open it still is, and
+            # ending the original before creating the new one keeps the two
+            # from ever both being open for the same callsign.
+            conn.execute(
+                "UPDATE flights SET ended_at=?, last_activity=? WHERE id=?",
+                (iso(at), iso(at), flight_id),
+            )
+            new_id = self._create_flight(conn, iso(at), flight["payload_callsign"])
+            conn.execute(
+                "UPDATE flights SET last_activity=?, ended_at=?, hidden=? WHERE id=?",
+                (flight["last_activity"], flight["ended_at"], flight["hidden"], new_id),
+            )
 
             for src in conn.execute("SELECT * FROM sources WHERE flight_id=?",
                                     (flight_id,)).fetchall():
@@ -1529,9 +1827,9 @@ class Store:
 
                 cur = conn.execute(
                     "INSERT INTO sources(flight_id, source_key, payload_name, task_name, "
-                    "first_seen, last_seen) VALUES (?,?,?,?,?,?)",
+                    "first_seen, last_seen, kind) VALUES (?,?,?,?,?,?,?)",
                     (new_id, src["source_key"], src["payload_name"], src["task_name"],
-                     iso(at), src["last_seen"]),
+                     iso(at), src["last_seen"], src["kind"]),
                 )
                 new_src = cur.lastrowid
 
@@ -1568,10 +1866,6 @@ class Store:
             # Sources with nothing left behind the cut are an artefact, not data.
             conn.execute(
                 "DELETE FROM sources WHERE flight_id=? AND packet_count=0", (flight_id,)
-            )
-            conn.execute(
-                "UPDATE flights SET ended_at=?, last_activity=? WHERE id=?",
-                (iso(at), iso(at), flight_id),
             )
 
         self._source_cache.clear()

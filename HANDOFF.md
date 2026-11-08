@@ -62,6 +62,8 @@ Being precise here matters more than the feature list.
 | SSE | 100 frames captured off the wire during a 60× replay; headers correct |
 | Exports | All six formats; CBOR byte-identical round trip; 15.5 MB snapshot passes `integrity_check` |
 | Split / merge | Round trip conserved every packet and GPS fix; series still readable |
+| Merging the prod twin flights | All 8 pairs on a 613 MB prod snapshot (2026-11-08): every distinct packet, fix and station reception kept, one GPS source per flight, `integrity_check` ok |
+| Twin flights no longer form | Replay of the 2026-10-23/24 receptions in arrival order: the untagged start is claimed by K5RWK, no untagged flight |
 | No-fix GPS | 18 no-fix + 27 fixed through the full chain; 0 rejects, none mapped, interpolation uncorrupted |
 
 ### Not verified — do these before trusting a flight
@@ -132,6 +134,20 @@ Things that fail *silently*. Each cost real time or nearly did.
 - **GPS receptions live in their own table.** Anything counting per-callsign
   activity must union `receptions` and `gps_receptions`. Joining only the former
   dropped a GPS-only station out of the reporters panel completely.
+
+- **A missing callsign is not a different transmitter.** The Wenet receiver
+  learns the callsign from SSDV image packets (`rx_ssdv.py`, `current_callsign`
+  starts as `""`), so everything before the first decoded image is untagged, and
+  receivers older than wenet `22f3779` never tag at all. Treating NULL as its own
+  identity gave every prod flight from 2026-08-16 to 2026-10-24 an untagged twin
+  running beside it with part of its telemetry. Untagged traffic is now
+  attributed (`Store._attribute_untagged`), the first tagged packet claims an
+  untagged start (`_claim_untagged`), and a partial unique index allows one open
+  flight per callsign. Do not put the "NULL is its own flight" rule back.
+- **Every FK child column needs an index.** `readings.packet_id` had none, so
+  each packet deleted by a merge's dedup scanned all 3.7M readings for its
+  cascade. Merging two real flights went from hours to seconds with
+  `idx_readings_packet`.
 
 ### Local dev gotchas
 

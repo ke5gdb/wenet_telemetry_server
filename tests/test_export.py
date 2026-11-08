@@ -362,7 +362,9 @@ def test_export_404s_rather_than_streaming_a_broken_file(client):
                       params={"source": "NOPE"}).status_code == 404
 
 
-def test_flight_admin_over_http(client):
+def test_flight_admin_over_http(client, monkeypatch):
+    monkeypatch.setattr(config, "ADMIN_PASSWORD", "hunter2")
+    client.headers["X-Admin-Password"] = "hunter2"
     client.post("/api/v1/ingest", json={"reporter_id": "KE5GDB",
                                         "packets": [sensor(1, 0, v_in=4.0)]})
 
