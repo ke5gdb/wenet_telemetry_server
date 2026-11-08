@@ -806,25 +806,37 @@ function applyUpdate(event) {
     return;
   }
 
+  /* A ground station draining its spool after an outage delivers history, not
+     news. The charts place it by payload time when they are re-queried, so it
+     fills the gap it belongs in; the live parts of the page must not take it as
+     the current state, which is all they show. Hence nothing below moves
+     backwards in time, and the map is re-fetched (sorted) rather than having
+     an old fix appended to the end of the line. */
   for (const [sourceKey, packet] of Object.entries(event.sources || {})) {
     const info = (state.latest?.sources || []).find((s) => s.source_key === sourceKey);
-    if (info) {
-      info.data = packet.data;
-      info.count = packet.count;
-      info.time = packet.time;
-      info.time_epoch = Date.parse(packet.time) / 1000;
-      // The event arriving *is* the reception, so this is the freshest possible
-      // answer on the clock staleness is measured against.
-      info.heard_epoch = serverNow();
-      info.packet_count += 1;
-    }
+    if (!info) continue;
+    // Stored all the same, so the tally counts it.
+    info.packet_count += 1;
+    const t = Date.parse(packet.time) / 1000;
+    // Compared on the source's own clock, which is the clock both are on.
+    if (Number.isFinite(info.time_epoch) && t < info.time_epoch) continue;
+    info.data = packet.data;
+    info.count = packet.count;
+    info.time = packet.time;
+    info.time_epoch = t;
+    // The event arriving *is* the reception, so this is the freshest possible
+    // answer on the clock staleness is measured against.
+    info.heard_epoch = serverNow();
   }
   if (event.gps?.length && state.latest) {
+    const epochOf = (p) => Date.parse(p.t) / 1000;
+    const shown = state.latest.gps_status?.time_epoch ?? -Infinity;
+    const current = event.gps.filter((p) => epochOf(p) >= shown);
     // Packets without a fix now arrive with null coordinates rather than being
     // dropped. Taking the last point blindly would blank the tiles every time
     // the receiver missed a lock, so position comes from the last point that
     // actually had one -- while the status below still reflects the newest.
-    const positioned = event.gps.filter((p) => p.lat != null);
+    const positioned = current.filter((p) => p.lat != null);
     const fix = positioned[positioned.length - 1];
     if (fix) {
       state.latest.gps = {
@@ -840,24 +852,33 @@ function applyUpdate(event) {
         state.latest.peak_altitude = Math.max(state.latest.peak_altitude ?? -Infinity, fix.alt);
       }
     }
-    const newest = event.gps[event.gps.length - 1];
-    state.latest.gps_status = {
-      ...(state.latest.gps_status || {}),
-      time_epoch: Date.parse(newest.t) / 1000,
-      num_sv: newest.num_sv,
-      has_position: newest.lat != null,
-      position_is_stale: newest.lat == null && !!state.latest.gps,
-    };
+    const newest = current[current.length - 1];
+    if (newest) {
+      state.latest.gps_status = {
+        ...(state.latest.gps_status || {}),
+        time_epoch: epochOf(newest),
+        num_sv: newest.num_sv,
+        has_position: newest.lat != null,
+        position_is_stale: newest.lat == null && !!state.latest.gps,
+      };
+    }
     // Don't extend the track past a window the user pinned by dragging: new
     // fixes fall outside it by definition.
     if (map.track && state.range.mode !== "absolute") {
-      for (const p of event.gps) {
-        if (p.lat == null) continue;
-        map.track.t.push(Date.parse(p.t) / 1000);
-        map.track.lat.push(p.lat); map.track.lon.push(p.lon); map.track.alt.push(p.alt);
+      const fixes = event.gps.filter((p) => p.lat != null);
+      const end = map.track.t.length ? map.track.t[map.track.t.length - 1] : -Infinity;
+      if (fixes.some((p) => epochOf(p) < end)) {
+        // Late fixes belong in the middle of the line. Appending them would
+        // draw it back to an old position and leave "now" sitting there.
+        refreshTrack();
+      } else if (fixes.length) {
+        for (const p of fixes) {
+          map.track.t.push(epochOf(p));
+          map.track.lat.push(p.lat); map.track.lon.push(p.lon); map.track.alt.push(p.alt);
+        }
+        map.setTrack(map.track);
+        el("map-empty").hidden = true;
       }
-      map.setTrack(map.track);
-      el("map-empty").hidden = true;
     }
   }
 
